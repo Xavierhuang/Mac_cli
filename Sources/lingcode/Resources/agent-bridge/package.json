@@ -1,0 +1,59 @@
+{
+  "name": "@weijiahuang/lingcode-cli",
+  "version": "0.12.3",
+  "description": "Terminal CLI for the LingCode agent loop — Claude Code-shape UX across 16 providers (Anthropic, LingModel, OpenAI, Gemini, DeepSeek, Groq, Mistral, xAI, Together, OpenRouter, Fireworks, Kimi, Qwen, z-ai, Ollama). Also ships the Node subprocess driver used by the LingCode Mac app.",
+  "main": "bridge.mjs",
+  "type": "commonjs",
+  "bin": {
+    "lingcode": "bin/lingcode.mjs"
+  },
+  "files": [
+    "bridge.mjs",
+    "sdk-bundle.mjs",
+    "zod-bundle.mjs",
+    "bin/",
+    "lib/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test --test-reporter=spec \"test/**/*.test.mjs\"",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "lingcode",
+    "claude",
+    "claude-code",
+    "cli",
+    "agent",
+    "ai",
+    "anthropic",
+    "openai",
+    "deepseek",
+    "gemini",
+    "mcp",
+    "tool-use"
+  ],
+  "author": "Jason Young",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Xavierhuang/LingCode.git",
+    "directory": "LingCode/agent-bridge"
+  },
+  "homepage": "https://lingcode.dev",
+  "bugs": {
+    "url": "https://github.com/Xavierhuang/LingCode/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.141"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk-darwin-arm64": "0.2.141"
+  }
+}
