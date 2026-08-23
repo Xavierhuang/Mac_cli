@@ -293,7 +293,9 @@ func runHeadlessClaude(
             : useDeepSeekDirect ? "deepseek-v4-pro[1m]"
             : ConfigStore.load().defaultClaudeModel)
 
-    let mcpServers = useMCP ? MCPConfig.load(cwd: cwd, overridePath: mcpConfigOverride) : [:]
+    let mcpServers = useMCP
+        ? mergingCloudMCP(MCPConfig.load(cwd: cwd, overridePath: mcpConfigOverride), cwd: cwd)
+        : [:]
     // LingModel mode: redirect the Anthropic SDK to our proxy. The bridge
     // already passes ANTHROPIC_API_KEY through extraEnvironment via the
     // `anthropicAPIKey` field; we just need to add the base URL.
@@ -406,29 +408,36 @@ func runHeadlessClaude(
                 toolCallCount += 1
                 lastToolName = name
                 lastToolInput = input
-                let _preTUPayload = HookPayload(
-                    event: .preToolUse,
-                    sessionId: lastSessionId ?? "headless-claude-pending",
-                    cwd: cwd.path,
-                    toolName: name,
-                    toolInput: input,
-                    provider: "claude"
-                )
-                let _preTUOutcome = await hooks.fire(
-                    event: .preToolUse,
-                    toolName: name,
-                    payload: _preTUPayload,
-                    cwd: cwd
-                )
-                // Claude path limitation: by the time .toolUse arrives, the bridge
-                // has already settled permission and is about to execute. A `.blocked`
-                // hook outcome here can't actually stop the tool. v1.1 fixes this by
-                // moving PreToolUse fire into AgentBridgeSession before the bridge's
-                // permission flow (see docs/HOOKS.md "v1.1 follow-ups").
-                if case .blocked(let reason) = _preTUOutcome {
-                    FileHandle.standardError.write(Data(
-                        "[hook] PreToolUse wanted to block \(name): \(reason) — Claude path can't block until v1.1\n".utf8
-                    ))
+                // PreToolUse fires in AgentBridgeSession.handlePermissionRequest —
+                // before the decider runs — so a `.blocked` outcome genuinely denies
+                // the tool, matching the OpenAI-compat/DeepSeek loops.
+                //
+                // bypassPermissions is the one mode where the SDK skips canUseTool
+                // entirely, so no permission request ever reaches that path. Fire here
+                // for that case only, so hooks still *observe* the call. Firing
+                // unconditionally (the previous shape) ran every PreToolUse hook twice
+                // per tool call in all other modes — visible to any hook with side
+                // effects: audit logs, counters, notifications, webhooks.
+                if mode == .bypassPermissions {
+                    let _preTUPayload = HookPayload(
+                        event: .preToolUse,
+                        sessionId: lastSessionId ?? "headless-claude-pending",
+                        cwd: cwd.path,
+                        toolName: name,
+                        toolInput: input,
+                        provider: "claude"
+                    )
+                    let _preTUOutcome = await hooks.fire(
+                        event: .preToolUse,
+                        toolName: name,
+                        payload: _preTUPayload,
+                        cwd: cwd
+                    )
+                    if case .blocked(let reason) = _preTUOutcome {
+                        FileHandle.standardError.write(Data(
+                            "[hook] PreToolUse blocked \(name): \(reason) — ignored: bypassPermissions/--yolo opts out of all gating.\n".utf8
+                        ))
+                    }
                 }
                 if streamJson {
                     emitStreamJson(["type": "tool_use", "name": name, "input": input])
@@ -455,9 +464,13 @@ func runHeadlessClaude(
                     payload: _postTUPayload,
                     cwd: cwd
                 )
-                // Note: PostToolUse stdout injection (ratified design) doesn't reach
-                // the model on the Claude path — the bridge has already consumed the
-                // tool result. v1.1's AgentBridgeSession surgery closes this gap.
+                // Known limitation: PostToolUse stdout injection (ratified design)
+                // doesn't reach the model on the Claude path — by the time `.toolResult`
+                // arrives the bridge has already handed the result to the SDK, so there
+                // is nothing left to append to. PostToolUse still fires for observation.
+                // Closing this needs the injection to happen bridge-side, in bridge.mjs,
+                // not here. (PreToolUse blocking, which shared this limitation, is fixed
+                // — see AgentBridgeSession.handlePermissionRequest.)
                 if streamJson {
                     emitStreamJson(["type": "tool_result", "content": content, "is_error": isError])
                 } else if !jsonOutput {
@@ -616,7 +629,7 @@ func runHeadlessClaude(
                 continue
 
             case .sdkMessage, .subagentStarted, .subagentFinished, .sessionRecovered,
-                 .memoryWriteRequest, .skillWriteRequest, .sessionSearchRequest:
+                 .memoryWriteRequest, .skillWriteRequest, .sessionSearchRequest, .terminalReadRequest:
                 continue
             }
         }

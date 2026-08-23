@@ -218,7 +218,7 @@ struct Repl: AsyncParsableCommand {
 
         // Anonymous heartbeat. Fire-and-forget. No-op if user opted out via
         // `lingcode telemetry off` or if a heartbeat already went out today.
-        Task.detached { await TelemetryClient.shared.sendHeartbeatIfDue(version: "0.8.21") }
+        Task.detached { await TelemetryClient.shared.sendHeartbeatIfDue(version: CLIVersion.current) }
 
         // Provider routing: non-claude providers use the OpenAI-compatible REPL
         // (text-only, no tools/MCP/hooks). Only `claude` goes through the Agent bridge.
@@ -810,12 +810,28 @@ struct Repl: AsyncParsableCommand {
                     let frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
                     var i = 0
                     while !Task.isCancelled {
+                        // A /dev/tty permission prompt is on screen. Our \r would
+                        // overwrite the question the user is being asked, so clear
+                        // our line once and stay quiet until they've answered.
+                        if TTYPromptState.isActive {
+                            // Write NOTHING. The decider clears the line
+                            // itself before drawing the prompt; a clear
+                            // from here lands after it and erases the
+                            // question the user is reading.
+                            try? await Task.sleep(nanoseconds: 80_000_000)
+                            continue
+                        }
                         let line = "\r\(frames[i % frames.count]) \(label)"
                         FileHandle.standardError.write(Data(ANSI.styled(line, ANSI.dim, fd: STDERR_FILENO).utf8))
                         i += 1
                         try? await Task.sleep(nanoseconds: 80_000_000)
                     }
-                    FileHandle.standardError.write(Data("\r\u{1B}[2K".utf8))
+                    // Erase the last spinner frame when the task ends — unless a
+                    // /dev/tty permission prompt is on screen, in which case this
+                    // \r + clear would wipe the question the user is answering.
+                    if !TTYPromptState.isActive {
+                        FileHandle.standardError.write(Data("\r\u{1B}[2K".utf8))
+                    }
                 }
             }
             func stopSpinner() {
@@ -1032,7 +1048,7 @@ struct Repl: AsyncParsableCommand {
                     await session.respondToUserInput(requestId: request.id, answers: [:], cancelled: true)
 
                 case .sdkMessage, .subagentStarted, .subagentFinished, .sessionRecovered,
-                     .memoryWriteRequest, .skillWriteRequest, .sessionSearchRequest:
+                     .memoryWriteRequest, .skillWriteRequest, .sessionSearchRequest, .terminalReadRequest:
                     break
                 }
             }
@@ -1378,7 +1394,7 @@ struct Repl: AsyncParsableCommand {
         let pad = String(repeating: " ", count: max(0, 28 - providerStr.count))
         let banner = """
         \(ANSI.styled("╭────────────────────────────────────────╮", ANSI.blue, fd: STDOUT_FILENO))
-        \(ANSI.styled("│", ANSI.blue, fd: STDOUT_FILENO))  LingCode v0.8.16  \(providerStr)\(pad)\(ANSI.styled("│", ANSI.blue, fd: STDOUT_FILENO))
+        \(ANSI.styled("│", ANSI.blue, fd: STDOUT_FILENO))  LingCode \(CLIVersion.display)  \(providerStr)\(pad)\(ANSI.styled("│", ANSI.blue, fd: STDOUT_FILENO))
         \(ANSI.styled("│", ANSI.blue, fd: STDOUT_FILENO))  /help for commands · Ctrl-D to exit   \(ANSI.styled("│", ANSI.blue, fd: STDOUT_FILENO))
         \(ANSI.styled("╰────────────────────────────────────────╯", ANSI.blue, fd: STDOUT_FILENO))
         """
@@ -1535,6 +1551,9 @@ struct Repl: AsyncParsableCommand {
             obj["data"] = data
         case .sessionSearchRequest(let data):
             obj["type"] = "session_search_request"
+            obj["data"] = data
+        case .terminalReadRequest(let data):
+            obj["type"] = "terminal_read_request"
             obj["data"] = data
         case .sessionRecovered(let reason, let message):
             obj["type"] = "session_recovered"

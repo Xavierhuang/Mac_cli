@@ -9,8 +9,10 @@ LingCode.app installed.
 ## When upstream changes, re-sync:
 
 ```bash
-cp ../../../../../LingCode/agent-bridge/{bridge.mjs,sdk-bundle.mjs,package.json,zod-bundle.mjs} \
+cp ../../../../../LingCode/agent-bridge/{bridge.mjs,sdk-bundle.mjs,package.json,zod-bundle.mjs,rtk.mjs,lingcode-cloud-mcp.mjs} \
    .
+rm -rf lib && mkdir lib && cp -R ../../../../../LingCode/agent-bridge/lib/. lib/
+find lib -name '*.test.mjs' -delete
 ```
 
 (Run from this directory, or use the equivalent absolute paths.)

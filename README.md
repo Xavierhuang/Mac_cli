@@ -1,5 +1,18 @@
 # lingcode — LingCode's terminal companion
 
+> **This repository is a read-only mirror, and a host for release binaries.**
+>
+> Canonical source: **[Xavierhuang/LingCode](https://github.com/Xavierhuang/LingCode)**,
+> under `LingCodeCLI/`. Open issues and pull requests there — changes pushed here
+> are overwritten on the next release.
+>
+> It does **not** build standalone: `Package.swift` carries path dependencies
+> (`../LingCodeAgentCore`, `../LingCodeACP`, `../LingCodeServer`) that only resolve
+> inside the canonical repo. It is here to be read, and so that each release tag
+> points at the source the published binaries were actually built from.
+>
+> Every release lists its upstream commit in the release notes.
+
 Swift Package that builds the `lingcode` binary, a terminal companion to
 LingCode.app. Ships inside the app bundle at
 `LingCode.app/Contents/Resources/bin/lingcode`.

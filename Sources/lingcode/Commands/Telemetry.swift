@@ -75,7 +75,7 @@ struct Telemetry: ParsableCommand {
             let payload: [String: Any] = [
                 "kind": "heartbeat",
                 "installId": c.currentInstallId,
-                "version": "0.8.16",
+                "version": CLIVersion.current,
                 "os": "macOS",
                 "arch": archString(),
                 "timestamp": ISO8601DateFormatter().string(from: Date())

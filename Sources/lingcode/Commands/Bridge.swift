@@ -25,10 +25,10 @@ struct BridgeCommand: ParsableCommand {
           lingcode bridge kill             # SIGTERM all of them
           lingcode bridge kill --force     # SIGKILL (last resort)
 
-        Note: a long-running bridge daemon — where `lingcode ask` connects to a
-        warm process instead of cold-spawning Node every time — is on the roadmap
-        but not yet shipped. This subcommand is for diagnosing the current
-        per-invocation model, not driving it.
+        The long-running daemon — where `lingcode ask --daemon` connects to a warm
+        process instead of cold-spawning Node every time — is shipped: see the
+        `daemon-start` / `daemon-stop` / `daemon-status` / `daemon-ping` subcommands.
+        The `status` and `kill` subcommands cover per-invocation bridges.
         """,
         subcommands: [BridgeStatus.self, BridgeKill.self, BridgeDaemonStart.self, BridgeDaemonStop.self, BridgeDaemonStatus.self, BridgeDaemonPing.self]
     )

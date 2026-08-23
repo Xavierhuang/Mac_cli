@@ -58,6 +58,14 @@ let package = Package(
                 .copy("Resources/agent-bridge"),
             ]
         ),
+        // Covers `lingcode`'s own logic that must stay byte-identical to the Mac
+        // app — the cloud project-key hash above all: a drift there silently points
+        // a folder at a DIFFERENT backend, which reads to the user as data loss.
+        .testTarget(
+            name: "LingCodeCLITests",
+            dependencies: ["lingcode"],
+            path: "Tests/LingCodeCLITests"
+        ),
         .testTarget(
             name: "LingCodeIPCTests",
             dependencies: ["LingCodeIPC"],

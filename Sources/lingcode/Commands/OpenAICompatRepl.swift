@@ -126,7 +126,8 @@ struct OpenAICompatREPL {
         var mcpStatuses: [MCPServerStatus] = []
         var toolRegistry = BuiltinTools.defaultRegistry()
         if mcpEnabled {
-            let (mgr, result) = await MCPManager.bootstrap(cwd: cwd, overridePath: mcpConfigPath)
+            let (mgr, result) = await MCPManager.bootstrap(cwd: cwd, overridePath: mcpConfigPath,
+                                                           extraServers: cloudMCPServers(for: cwd))
             mcpManager = mgr
             mcpStatuses = result.statuses
             if !result.executors.isEmpty {
@@ -701,13 +702,32 @@ struct OpenAICompatREPL {
                         spinnerTask = Task {
                             let frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
                             var i = 0
-                            while !Task.isCancelled {
+                                    while !Task.isCancelled {
+                                // A /dev/tty permission prompt is on screen. Our
+                                // \r would overwrite the question the user is
+                                // being asked, so clear our line once and stay
+                                // quiet until they've answered.
+                                if TTYPromptState.isActive {
+                                    // Write NOTHING. The decider clears the line
+                                    // itself before drawing the prompt; a clear
+                                    // from here lands after it and erases the
+                                    // question the user is reading.
+                                    try? await Task.sleep(nanoseconds: 80_000_000)
+                                    continue
+                                }
                                 let line = "\r\(frames[i % frames.count]) \(label)"
                                 FileHandle.standardError.write(Data(ANSI.styled(line, ANSI.dim, fd: STDERR_FILENO).utf8))
                                 i += 1
                                 try? await Task.sleep(nanoseconds: 80_000_000)
                             }
-                            FileHandle.standardError.write(Data("\r\u{1B}[2K".utf8))
+                            // Erase the last spinner frame when the task ends —
+                            // UNLESS a /dev/tty permission prompt is on screen,
+                            // in which case this \r + clear would wipe the very
+                            // question the user is answering. (The decider draws
+                            // its own line; leave it alone.)
+                            if !TTYPromptState.isActive {
+                                FileHandle.standardError.write(Data("\r\u{1B}[2K".utf8))
+                            }
                         }
                     }
                     func stopSpinner() {
@@ -740,7 +760,13 @@ struct OpenAICompatREPL {
                             for cmd in hooksForTurn.commands(for: .preToolUse, toolName: name) {
                                 await runHook(cmd, toolName: name, toolInput: args, cwd: cwdForTurn)
                             }
-                            // Tool is about to run (or wait on permission); show motion.
+                            // Tool is about to run — or to sit on a permission
+                            // prompt. This loop has no permissionRequested event
+                            // to key off (unlike the Claude loop, which starts
+                            // its spinner on permissionResolved), so the spinner
+                            // starts here and yields via TTYPromptState if a
+                            // prompt appears. Without that it repaints over the
+                            // prompt every 80ms and mangles it.
                             startSpinner("running \(name)…")
                         case .permissionDenied(let name, let reason, _):
                             stopSpinner()

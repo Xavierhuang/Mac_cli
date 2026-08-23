@@ -292,7 +292,8 @@ private func runOpenAICompatAgentic(
     var mcpManager: MCPManager? = nil
     var mcpExecutors: [any ToolExecutor] = []
     if mcpEnabled {
-        let (mgr, result) = await MCPManager.bootstrap(cwd: cwd, overridePath: mcpConfigPath)
+        let (mgr, result) = await MCPManager.bootstrap(cwd: cwd, overridePath: mcpConfigPath,
+                                                       extraServers: cloudMCPServers(for: cwd))
         mcpManager = mgr
         mcpExecutors = result.executors
         for status in result.statuses {

@@ -6,8 +6,8 @@ import LingCodeAgentCore
 /// `lingcode trust --list` — show all trusted projects.
 /// `lingcode trust --remove [<path>]` — untrust a project.
 ///
-/// v1 ships the store and management commands; load-path enforcement (block hooks
-/// from untrusted projects) lands in v1.1 with the TTY trust prompt. See docs/HOOKS.md.
+/// Enforcement is live in `HooksConfig.load`: untrusted projects have their hook rules
+/// skipped, with a TTY prompt to opt in. See docs/HOOKS.md.
 @available(macOS 10.15, macCatalyst 13, iOS 13, tvOS 13, watchOS 6, *)
 struct Trust: AsyncParsableCommand {
     static var configuration = CommandConfiguration(
@@ -15,8 +15,9 @@ struct Trust: AsyncParsableCommand {
         abstract: "Manage trusted projects for hook execution.",
         discussion: """
         Hooks in a project's .claude/settings.json are arbitrary shell commands that run \
-        during agent activity. v1.1 will require explicit trust before firing project-local \
-        hooks; v1 ships the store and CLI so users can opt-in early.
+        during agent activity, so LingCode requires explicit trust before firing them. \
+        Untrusted projects have their hooks skipped; on a TTY you are prompted once. \
+        Editing .claude/settings.json revokes trust until you re-confirm.
 
         Examples:
           lingcode trust                # trust the current directory

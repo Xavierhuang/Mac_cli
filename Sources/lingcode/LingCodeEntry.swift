@@ -99,7 +99,7 @@ struct LingCode: AsyncParsableCommand {
 
         Run `lingcode help <subcommand>` for detailed options on any command.
         """,
-        version: "0.8.22",
+        version: CLIVersion.current,
         subcommands: subcommandList(),
         defaultSubcommand: Repl.self
     )
@@ -139,8 +139,15 @@ internal func parseGotoArgument(_ arg: String) -> (path: String, line: Int?, col
 /// Powers the `did you mean…` suggestion when a user mistypes a subcommand.
 @available(macOS 10.15, macCatalyst 13, iOS 13, tvOS 13, watchOS 6, *)
 private func closestSubcommandName(to name: String) -> String? {
-    let candidates = subcommandList().map { String(describing: $0).lowercased() }
-        + ["mcp", "plugin"] // anticipate near-future subcommands
+    // Use each command's DECLARED name, not its Swift type name. Type names diverge
+    // from the CLI spelling often enough that the old `String(describing:)` shape
+    // suggested commands that don't exist — `doctorcommand` for DoctorCommand,
+    // `acpserve` for `acp-serve`, `generatexcodeproject` for `generate-xcodeproj`.
+    // (The previously hardcoded `["mcp", "plugin"]` extras were a hand-patch for
+    // this same bug, not placeholders for future subcommands.)
+    let candidates = subcommandList().map {
+        $0.configuration.commandName ?? String(describing: $0).lowercased()
+    }
     let lower = name.lowercased()
     var best: (String, Int)?
     for c in candidates {
@@ -176,10 +183,12 @@ fileprivate func subcommandList() -> [ParsableCommand.Type] {
         Ask.self,
         Auth.self,
         Build.self,
+        GenerateXcodeProject.self,
         Convert.self,
         Deploy.self,
         Config.self,
         Init.self,
+        Positioning.self,
         History.self,
         Completion.self,
         Upgrade.self,

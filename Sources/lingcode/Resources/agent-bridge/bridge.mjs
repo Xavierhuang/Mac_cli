@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { dirname as nodeDirname } from 'node:path'
 import { spawn, execSync } from 'node:child_process'
 import { rtkRewriteCommand } from './rtk.mjs'
+import { productionBackendApplyMetadata } from './lib/backend-deploy-permission.mjs'
+import { claudeEffortOption } from './lib/claude-effort.mjs'
 
 // When the bundled rtk is configured, prepend its directory to PATH so the
 // SDK's bash subprocess can resolve the bare `rtk` command after our hook
@@ -68,6 +70,62 @@ const NARRATION_DIRECTIVE = [
   'Keep each narration line under 25 words.',
 ].join(' ')
 
+// You run *inside* LingCode but have no LingCode source in scope and no LingCode
+// internals in your training data, so without this you guess (wrongly) when asked
+// about the product itself. Keep high-level; defer specifics to the `lingcode_docs`
+// tool rather than inventing commands/pricing.
+const LINGCODE_ABOUT_DIRECTIVE = [
+  '# About LingCode (the application you are running inside)',
+  '',
+  'You ARE running inside LingCode. These are established facts — state them directly when asked; do NOT hedge ("looks like", "appears to be") or guess by inferring from tool names, and do NOT compare it to Supabase/Firebase as if unsure what it is.',
+  '',
+  'LingCode is an all-in-one native macOS AI coding IDE that also ships a `lingcode` CLI, iPad and Android apps, and a managed Cloud backend.',
+  '',
+  '**LingCode Cloud** is a managed backend-as-a-service (its own product, not a third party): a managed **Postgres** database with built-in **auth** (email/password, magic-link, OTP, Google/GitHub/Apple OAuth), **file storage**, **realtime** row subscriptions (RLS-filtered), **vector search** (pgvector), server-side **serverless functions** (sandboxed Deno + built-ins like email/Stripe/http-fetch) and an encrypted secrets vault, plus full-stack **app hosting** (static frontends at lingcode.dev/apps/, and SSR apps — Next.js/SvelteKit/Nuxt/Astro/Remix/TanStack — on Cloudflare Workers at *.run.lingcode.dev). The data API (via the `lingcode-cloud` MCP tools and the injected `window.lingcode` SDK) supports single-table CRUD with filters, **batch insert**, **upsert** (`ON CONFLICT`), and **`rpc`** for complex reads (JOINs/CTEs/aggregates/full-text ranking) defined as SQL functions in a migration. So secrets, Stripe, email, and most server logic run ON LingCode Cloud — don\'t tell users to stand up an external server or use localStorage for shared/persisted data.',
+  '',
+  'BUT it is an EDGE/SERVERLESS platform, NOT a general-purpose server host — do NOT claim it "hosts everything." Its hosting runtime is a Cloudflare V8 isolate, NOT Node.js, so it does NOT run: long-running Node processes, persistent WebSocket servers, background queues/workers, a single request over ~30s, or non-JS backends (Python/Django, Rails, Go). A plain Express/`next start` server must be ported to a Worker-targeting framework (Hono, TanStack Start, OpenNext adapter). Work that doesn\'t fit (scrapers, long ingest pipelines, minutes-long jobs) runs on a server the USER operates and writes into the managed backend over the gateway.',
+  '',
+  'Deploy a web app to LingCode Cloud three ways: the in-app "Deploy to Cloud" button, the `lingcode cloud deploy` CLI, and the /try web playground. (The Swift CLI\'s `lingcode deploy` is a SEPARATE iOS App Store / TestFlight flow — not web hosting.)',
+  '',
+  'Multi-provider agent: Claude (default, full tool use), DeepSeek, and other OpenAI-compatible providers — all with tool use and MCP.',
+  '',
+  'When a backend is connected/available you have the `describe_backend` MCP tool — call it for LIVE capabilities, tiers and quotas before designing a data/auth/backend feature. For anything beyond this summary, call the `lingcode_docs` tool (grounded in the live docs). Use these tools rather than guessing; never invent LingCode features, commands, or pricing. Only volunteer this when the user asks about LingCode itself; otherwise stay focused on their project.',
+].join('\n')
+
+// The Xcode-shaped work LingCode does in-app. Without this the agent answers
+// signing and destination problems with "open Xcode" or "build for the
+// simulator instead" — sending the user out of the IDE for things it already
+// does, which is the one thing LingCode is for. Kept to a symptom → surface
+// map rather than a feature tour: this lands in every turn's system prompt.
+const LINGCODE_IDE_SURFACES_DIRECTIVE = [
+  '# Xcode work you can do inside LingCode',
+  '',
+  'These exist in the app. When one of these symptoms comes up, name the LingCode surface FIRST; mention Xcode only as an alternative, and never as the only option.',
+  '',
+  '- "Signing for X requires a development team" / no `DEVELOPMENT_TEAM` → Settings → Build & Ship → **Signing & Teams**. It writes `DEVELOPMENT_TEAM` into `project.pbxproj`, including for projects that have never been signed, and also sets signing style (Automatic/Manual).',
+  '- Bundle id, version/build, deployment target, sanitizer → Settings → Build & Ship → **Build Settings**.',
+  '- Info.plist keys (privacy strings, URL schemes, display name) → Settings → Build & Ship → **Info.plist Editor**.',
+  '- Push/HealthKit/iCloud and other entitlements → Settings → Build & Ship → **Capabilities & Entitlements**.',
+  '- "Which device will this run on?" / picking a simulator or a connected iPhone → the **run-destination picker** in the window toolbar. It lists My Mac, paired devices and simulators, filtered to the platforms the open project actually builds for.',
+  '- "Why won\'t this run on my phone?" — Developer Mode off, no iOS SDK, no signing identity, Xcode too old for the phone\'s iOS, no team, template bundle id → **Mobile → Signing & Deployment Preflight** (also Settings → Build & Ship → Setup Checklist). It checks each one and offers the fix.',
+  '- Uploading to TestFlight / App Store Connect → the **Ship** flow (`⌘⇧⌥S`).',
+  '- App icons and launch screens → **App Icon Generator** and **Splash Screen** in the same menus.',
+  '',
+  'A macOS-only project cannot build for a phone and an iPhone-only project cannot build for My Mac; if a build fails with "destination doesn\'t match the app\'s supported platforms", that mismatch is the cause — not signing.',
+  '',
+  'The `lingcode` CLI is always on PATH. Prefer it over external tooling:',
+  '- Swift files with no `.xcodeproj` → `lingcode generate-xcodeproj` (never suggest XcodeGen, Tuist, `swift package init`, or "open Xcode → File → New Project").',
+  '- Unexplained tool failures / "my setup is broken" → `lingcode doctor` before guessing.',
+  '- LingCode embeds and signs its own Node — never tell the user to `brew install node` or install global npm packages.',
+  '',
+  'Only volunteer this when it is relevant to what the user is doing.',
+].join('\n')
+
+// Base URL for LingCode website APIs the bridge calls directly (e.g. the docs
+// RAG). Override via env for staging/local. No trailing slash.
+const LINGCODE_API_BASE =
+  (process.env.LINGCODE_API_BASE || 'https://lingcode.dev').replace(/\/+$/, '')
+
 // When LingModel is the active provider, the underlying model inherits Claude
 // Code's massive "You are Claude" system prompt and confidently misidentifies
 // itself if asked. We can't replace that prompt (would break tool semantics),
@@ -111,6 +169,20 @@ let activeAbortController = null
 let currentModel = normalizeString(process.env.LINGCODE_CLAUDE_MODEL) ?? null
 const pendingPermissionRequests = new Map()
 
+// Defense-in-depth: if the SDK stream goes silent mid-query (a stalled upstream
+// API that emits nothing further), abort it after this much inactivity and emit a
+// real `query_failed` event instead of hanging forever. Kept BELOW the Swift
+// `stallThreshold` (~120s) so Node aborts first and the app renders a clean
+// failure rather than relying on its own heartbeat backstop.
+const PER_QUERY_INACTIVITY_MS = 90_000
+
+// While the model is generating a tool's input (e.g. a large Write whose content
+// is the whole file), the SDK surfaces NO intermediate messages for the entire
+// generation — which can legitimately run for minutes. Use a much more generous
+// ceiling in that window so we don't abort a turn that's provably mid-generation;
+// it still catches a truly hung generation, just later.
+const TOOL_GEN_INACTIVITY_MS = 600_000
+
 // ── Mid-flight directive plumbing ─────────────────────────────────────────
 // `injectDirective(_:)` on the Swift side sends `{type:'inject_directive'}`;
 // runPrompt's prompt input becomes an async iterable that drains this queue
@@ -142,6 +214,14 @@ const originalAnthropicAPIKey = process.env.ANTHROPIC_API_KEY
 // LingModel: single tier as of the Standard/Advanced collapse. Every public
 // id and every legacy alias resolves to the same upstream model. Aliases stay
 // accepted so older prefs/CLI/scripts keep routing through the proxy.
+//
+// Return the `"auto"` sentinel (NOT a hardcoded model literal): the proxy's
+// applyLingModelCostControls rewrites `"auto"` to the DB-configured real model
+// (LINGMODEL_DEFAULT_MODEL / FORCE_MODEL), which is production's source of truth.
+// A hardcoded literal here bypasses that mapping (it's only rewritten when the
+// value is `"auto"`), so a config change would leave the bridge asking upstream
+// for a model that no longer exists — a silent model-not-found. The native path
+// (AIService) already sends `"auto"`; this keeps the two loops consistent.
 function lingModelUpstream(tag) {
   if (
     tag === 'lingmodel-standard' ||
@@ -150,13 +230,13 @@ function lingModelUpstream(tag) {
     tag === 'lingmodel-pro' ||
     tag === 'lingmodel'
   ) {
-    return 'kimi-k2.7'
+    return 'auto'
   }
   return null
 }
 const isLingModelTag = (m) => lingModelUpstream(m) !== null
 
-// User-defined Anthropic-compatible endpoints. Shape: { "<id>": { baseURL, apiKey } }.
+// User-defined Anthropic-compatible endpoints. Shape: { "<id>": { baseURL, apiKey, model? } }.
 // Populated once at startup by the Swift host (LingCode/Services/ClaudeCodeAgentService.swift).
 // Tags are `custom:<id>` and route to ANTHROPIC_BASE_URL/AUTH_TOKEN via `applyProviderEnv`.
 let customEndpoints = {}
@@ -566,6 +646,57 @@ async function handleSessionSearchResponse(command) {
   }
 }
 
+// ── Terminal read round-trip ────────────────────────────────────────────
+// The read_terminal / list_terminals / tail_terminal MCP tools emit a
+// terminal_read_request over stdout; the app reads the user's VISIBLE terminal
+// tabs (Swift TerminalBufferReader on TerminalSessionManager.shared) and replies
+// with terminal_read_response. This is how the Claude (Anthropic) agent — which
+// otherwise only sees output of shells it spawned itself via Bash — can read a
+// separate terminal tab the user is running. Same shape as the memory round-trip.
+const pendingTerminalReads = new Map()
+const TERMINAL_READ_TIMEOUT_MS = 15_000
+
+function rejectAllPendingTerminalReads(reason) {
+  for (const [requestId, pending] of pendingTerminalReads.entries()) {
+    pending.cleanup?.()
+    pendingTerminalReads.delete(requestId)
+    pending.reject(new Error(reason))
+  }
+}
+
+function requestTerminalRead(payload) {
+  return new Promise((resolve, reject) => {
+    const requestId = randomUUID()
+    const timer = setTimeout(() => {
+      if (!pendingTerminalReads.has(requestId)) return
+      pendingTerminalReads.delete(requestId)
+      reject(new Error(`Terminal read request ${requestId} timed out after ${TERMINAL_READ_TIMEOUT_MS}ms.`))
+    }, TERMINAL_READ_TIMEOUT_MS)
+    pendingTerminalReads.set(requestId, { resolve, reject, cleanup: () => clearTimeout(timer) })
+    emit({ type: 'terminal_read_request', requestId, ...payload })
+  })
+}
+
+async function handleTerminalReadResponse(command) {
+  const requestId = normalizeString(command.requestId)
+  if (!requestId) {
+    emitError('terminal_read_response requires requestId.', { code: 'missing_terminal_request_id' })
+    return
+  }
+  const pending = pendingTerminalReads.get(requestId)
+  if (!pending) {
+    emitError(`No pending terminal read found for ${requestId}.`, { requestId, code: 'unknown_terminal_request' })
+    return
+  }
+  pendingTerminalReads.delete(requestId)
+  pending.cleanup?.()
+  if (command.ok === true) {
+    pending.resolve({ ok: true, text: normalizeString(command.text) ?? '' })
+  } else {
+    pending.resolve({ ok: false, text: normalizeString(command.error) ?? 'Terminal read failed.' })
+  }
+}
+
 // ── lingcode-memory SDK MCP server ──────────────────────────────────────
 // Registered when zod is available. Two tools: memory_save and memory_remove.
 // Both round-trip to Swift via requestMemoryWrite().
@@ -728,10 +859,101 @@ function buildLingcodeMemoryServer() {
     },
   )
 
+  // Answer questions about LingCode ITSELF (features, CLI commands, pricing,
+  // how-to) from the live docs via the website RAG endpoint. The model has no
+  // LingCode internals in scope, so this is its grounded source of truth — it
+  // beats guessing. Direct network call (no Swift round-trip needed); the
+  // endpoint is public and rate-limited server-side.
+  const lingcodeDocsTool = sdkTool(
+    'lingcode_docs',
+    'Look up how LingCode itself works — its features, CLI commands, deployment, Cloud backend, pricing, or any "how do I … in LingCode" question — grounded in the official LingCode documentation. Use this instead of guessing whenever the user asks about LingCode the product (not their own project code). Returns an answer plus source links.',
+    {
+      query: z.string().min(1).max(1000).describe('A natural-language question about LingCode the product (1–1000 chars). Example: "How do I deploy a web app to LingCode Cloud?"'),
+    },
+    async (args) => {
+      try {
+        const res = await fetch(`${LINGCODE_API_BASE}/api/site-chat/ask`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ question: args.query }),
+          signal: AbortSignal.timeout(20_000),
+        })
+        const body = await res.json().catch(() => null)
+        if (!res.ok || !body || body.ok !== true || !body.data) {
+          const msg = (body && (body.message || body.error)) || `HTTP ${res.status}`
+          return { content: [{ type: 'text', text: `lingcode_docs unavailable: ${msg}` }], isError: true }
+        }
+        const answer = normalizeString(body.data.answer) || 'No answer found in the docs.'
+        const sources = Array.isArray(body.data.sources) ? body.data.sources : []
+        const sourcesText = sources.length
+          ? '\n\nSources:\n' + sources
+              .filter((s) => s && s.url)
+              .map((s) => `- ${s.title || s.url} (${s.url})`).join('\n')
+          : ''
+        return { content: [{ type: 'text', text: answer + sourcesText }], isError: false }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { content: [{ type: 'text', text: `lingcode_docs failed: ${message}` }], isError: true }
+      }
+    },
+  )
+
+  const readTerminalTool = sdkTool(
+    'read_terminal',
+    "Read the visible buffer + scrollback of one of the USER's terminal tabs in LingCode (the terminals they have open in the bottom panel — NOT shells you spawned; use bash_output for those). `session` accepts a session UUID, a tab-name substring ('build', 'server'), or 'focused'/'active'/empty for whichever tab is currently focused. Use this when the user says 'look at my terminal', 'what's the build saying', 'fix what just errored'.",
+    {
+      session: z.string().optional().describe("Session UUID, tab-name substring, or 'focused' (default = the focused tab)."),
+      max_lines: z.number().optional().describe('Max lines to return (default 500, cap 5000).'),
+    },
+    async (args) => {
+      try {
+        const result = await requestTerminalRead({ op: 'read', session: args.session ?? '', max_lines: args.max_lines })
+        return { content: [{ type: 'text', text: result.text }], isError: !result.ok }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { content: [{ type: 'text', text: `read_terminal failed: ${message}` }], isError: true }
+      }
+    },
+  )
+
+  const listTerminalsTool = sdkTool(
+    'list_terminals',
+    "List every terminal tab the user has open in LingCode (session IDs, display names, which is focused, ~line counts). Use before read_terminal / tail_terminal to pick the right tab when the user is ambiguous — or skip it and pass session='focused' to read whatever they're looking at.",
+    {},
+    async () => {
+      try {
+        const result = await requestTerminalRead({ op: 'list' })
+        return { content: [{ type: 'text', text: result.text }], isError: !result.ok }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { content: [{ type: 'text', text: `list_terminals failed: ${message}` }], isError: true }
+      }
+    },
+  )
+
+  const tailTerminalTool = sdkTool(
+    'tail_terminal',
+    "Return only the terminal content that's new since `after_line` — for 'watch the build and tell me when it fails' loops. Call with after_line=0 first, then pass the `next_line` value the previous call returned. `session` works like read_terminal ('focused' default).",
+    {
+      session: z.string().optional().describe("Session UUID, tab-name substring, or 'focused' (default)."),
+      after_line: z.number().optional().describe('Return content after this line index (default 0).'),
+      max_lines: z.number().optional().describe('Max lines to return (default 500, cap 5000).'),
+    },
+    async (args) => {
+      try {
+        const result = await requestTerminalRead({ op: 'tail', session: args.session ?? '', after_line: args.after_line ?? 0, max_lines: args.max_lines })
+        return { content: [{ type: 'text', text: result.text }], isError: !result.ok }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { content: [{ type: 'text', text: `tail_terminal failed: ${message}` }], isError: true }
+      }
+    },
+  )
+
   return createSdkMcpServer({
     name: 'lingcode-memory',
     version: '1.0.0',
-    tools: [saveTool, removeTool, skillProposeTool, sessionSearchTool, simulatorScreenshotTool],
+    tools: [saveTool, removeTool, skillProposeTool, sessionSearchTool, simulatorScreenshotTool, lingcodeDocsTool, readTerminalTool, listTerminalsTool, tailTerminalTool],
   })
 }
 
@@ -836,8 +1058,82 @@ function buildSubagentLifecycleHooks(queryId) {
   return hooks
 }
 
-function createPermissionHandler(queryId, permissionMode) {
+function requestToolPermission(queryId, toolName, input, options = {}) {
+  return new Promise((resolve, reject) => {
+    const requestId = randomUUID()
+    let settled = false
+
+    const cleanup = () => {
+      settled = true
+      if (options.signal && abortHandler) {
+        options.signal.removeEventListener('abort', abortHandler)
+      }
+    }
+
+    const abortHandler = () => {
+      if (settled) return
+      cleanup()
+      pendingPermissionRequests.delete(requestId)
+      reject(new Error(`Permission request ${requestId} aborted.`))
+    }
+
+    if (options.signal?.aborted) {
+      abortHandler()
+      return
+    }
+
+    if (options.signal) {
+      options.signal.addEventListener('abort', abortHandler, { once: true })
+    }
+
+    pendingPermissionRequests.set(requestId, {
+      resolve: (result) => {
+        if (settled) return
+        cleanup()
+        resolve(result)
+      },
+      reject: (error) => {
+        if (settled) return
+        cleanup()
+        reject(error)
+      },
+      cleanup,
+      originalInput: input,
+    })
+
+    emit({
+      type: 'permission_request',
+      queryId,
+      requestId,
+      toolName,
+      input,
+      options: {
+        suggestions: options.forceOneTime ? [] : (options.suggestions ?? []),
+        blockedPath: options.blockedPath ?? null,
+        decisionReason: options.decisionReason ?? null,
+        title: options.title ?? null,
+        displayName: options.displayName ?? null,
+        description: options.description ?? null,
+        toolUseID: options.toolUseID,
+        agentID: options.agentID ?? null,
+      },
+    })
+  })
+}
+
+function createPermissionHandler(queryId, initialPermissionMode) {
   return async (toolName, input, options = {}) => {
+    // Read the mode at DECISION time, not at capture time. This handler is built
+    // once per query, so capturing the mode meant a mid-turn switch never applied
+    // to the turn already running: flipping to Bypass to stop being interrupted
+    // left AskUserQuestion on the interactive path, waiting for an answer the app
+    // had stopped intending to give — a hung turn.
+    //
+    // `defaultPermissionMode` tracks the live value (set at query start, updated
+    // by `set_permission_mode`). Safe as a module global because there is one
+    // bridge process per session — the daemon mode is an explicit no-op, see
+    // `lib/commands.mjs`.
+    const permissionMode = defaultPermissionMode || initialPermissionMode
     // AskUserQuestion is NOT a permission gate — it's the model asking the user
     // a multiple-choice question.
     //   • bypassPermissions ("yolo"): the user wants zero interruptions, so we
@@ -855,6 +1151,25 @@ function createPermissionHandler(queryId, permissionMode) {
       }
       return requestUserInputAnswer(queryId, input, options)
     }
+    // Applying a production backend plan is the exception to yolo/bypass: it
+    // always requires a real one-time click. The server validates that the
+    // summary and warnings shown here exactly match its short-lived plan.
+    const productionDeploy = productionBackendApplyMetadata(toolName, input)
+    if (productionDeploy) {
+      if (permissionMode === 'dontAsk') {
+        return {
+          behavior: 'deny',
+          message: 'Production backend deployment requires explicit user approval.',
+          decisionClassification: 'user_reject',
+        }
+      }
+      return requestToolPermission(queryId, toolName, input, {
+        ...options,
+        title: productionDeploy.title,
+        description: productionDeploy.description,
+        forceOneTime: true,
+      })
+    }
     // Belt-and-suspenders for bypassPermissions. The SDK is supposed to
     // short-circuit canUseTool when allowDangerouslySkipPermissions is true,
     // but we don't want the user to ever see an approval dialog under bypass
@@ -871,66 +1186,7 @@ function createPermissionHandler(queryId, permissionMode) {
         decisionClassification: 'user_reject',
       }
     }
-    return new Promise((resolve, reject) => {
-      const requestId = randomUUID()
-      let settled = false
-
-      const cleanup = () => {
-        settled = true
-        if (options.signal && abortHandler) {
-          options.signal.removeEventListener('abort', abortHandler)
-        }
-      }
-
-      const abortHandler = () => {
-        if (settled) return
-        cleanup()
-        pendingPermissionRequests.delete(requestId)
-        reject(new Error(`Permission request ${requestId} aborted.`))
-      }
-
-      if (options.signal?.aborted) {
-        abortHandler()
-        return
-      }
-
-      if (options.signal) {
-        options.signal.addEventListener('abort', abortHandler, { once: true })
-      }
-
-      pendingPermissionRequests.set(requestId, {
-        resolve: (result) => {
-          if (settled) return
-          cleanup()
-          resolve(result)
-        },
-        reject: (error) => {
-          if (settled) return
-          cleanup()
-          reject(error)
-        },
-        cleanup,
-        originalInput: input,
-      })
-
-      emit({
-        type: 'permission_request',
-        queryId,
-        requestId,
-        toolName,
-        input,
-        options: {
-          suggestions: options.suggestions ?? [],
-          blockedPath: options.blockedPath ?? null,
-          decisionReason: options.decisionReason ?? null,
-          title: options.title ?? null,
-          displayName: options.displayName ?? null,
-          description: options.description ?? null,
-          toolUseID: options.toolUseID,
-          agentID: options.agentID ?? null,
-        },
-      })
-    })
+    return requestToolPermission(queryId, toolName, input, options)
   }
 }
 
@@ -1077,6 +1333,43 @@ function isResumeNotFoundError(error) {
   return /No conversation found with session/i.test(msg)
 }
 
+// Anthropic rejects a resumed transcript whose stored thinking block carries a
+// truncated/invalid `signature` (the signature streams as a trailing
+// `signature_delta`, so a run cut off mid-thinking persists an unverifiable
+// block). On resume the CLI replays it and the API 400s. The transcript is
+// unrepairable client-side, so we recover by retrying once as a fresh session
+// (re-seeding prior context as text — see resumeFallbackContext).
+function isThinkingSignatureError(error) {
+  const msg = error instanceof Error ? error.message : String(error ?? '')
+  return /signature/i.test(msg) && /thinking block/i.test(msg)
+}
+
+// Prepend a plain-text context preamble to the next-turn prompt. Handles both
+// prompt shapes the SDK accepts: a bare string (no attachments) and an async
+// iterable of user messages (attachments present — inject the context as a
+// leading text block on the first user message).
+function prependContextToPrompt(promptInput, contextText) {
+  if (!contextText) return promptInput
+  if (typeof promptInput === 'string') {
+    return contextText + '\n\n' + promptInput
+  }
+  return (async function* contextSeededPrompt() {
+    let injected = false
+    for await (const m of promptInput) {
+      if (!injected && m && m.message && m.message.role === 'user') {
+        const content = m.message.content
+        if (Array.isArray(content)) {
+          m.message.content = [{ type: 'text', text: contextText }, ...content]
+        } else if (typeof content === 'string') {
+          m.message.content = contextText + '\n\n' + content
+        }
+        injected = true
+      }
+      yield m
+    }
+  })()
+}
+
 async function runPrompt(command) {
   if (activeQuery) {
     emitError('A Claude query is already running.', {
@@ -1156,6 +1449,10 @@ async function runPrompt(command) {
     ? command.additionalDirectories.filter((d) => typeof d === 'string' && d.length > 0)
     : undefined
   const thinkingEnabled = command.thinking === true
+  // Optional plain-text rendering of the prior conversation, sent by Swift only
+  // when this turn resumes a session. Used solely on corruption recovery to
+  // re-seed continuity in the fresh session.
+  const resumeFallbackContext = normalizeString(command.resumeFallbackContext)
 
   defaultPermissionMode = permissionMode
 
@@ -1165,13 +1462,15 @@ async function runPrompt(command) {
   applyProviderEnv(currentModel)
   // LingModel: single tier, send the unified upstream id. Server still gates
   // (allowlist + per-tier caps) and may rewrite to a different id via env.
-  // Custom Anthropic-compatible endpoints: most proxies route by their own model regardless
-  // of what we send, but the SDK requires a valid-looking Anthropic model id, so default
-  // the wire name to claude-sonnet-4-6.
+  // Custom Anthropic-compatible endpoints: send the per-endpoint model the user pinned
+  // (e.g. `glm-5.2` for a z.ai endpoint) so gateways that honor the model param route to
+  // the right model. When none is set, fall back to a valid-looking Anthropic model id
+  // (`claude-sonnet-4-6`) since the SDK requires one and most proxies route by their own
+  // config regardless.
   const effectiveModel = isLingModelTag(currentModel)
     ? lingModelUpstream(currentModel)
     : isCustomTag(currentModel)
-      ? 'claude-sonnet-4-6'
+      ? (customEndpointFor(currentModel)?.model || 'claude-sonnet-4-6')
       : currentModel
 
   emit({
@@ -1180,6 +1479,7 @@ async function runPrompt(command) {
     cwd,
     permissionMode,
     resumeSessionId: resumeSessionId ?? null,
+    rss: process.memoryUsage().rss,
   })
 
   // Build options once; `resume` and `abortController` are the only fields that
@@ -1205,11 +1505,14 @@ async function runPrompt(command) {
     ...(mcpServers ? { mcpServers } : {}),
     ...(customSystemPrompt ? { systemPrompt: customSystemPrompt } : {}),
     ...(additionalDirectories ? { additionalDirectories } : {}),
+    ...claudeEffortOption(command.effort),
     ...(thinkingEnabled ? { thinking: { type: 'enabled', budget_tokens: command.thinkingBudgetTokens ?? 8000 } } : {}),
     ...(customAgents && Object.keys(customAgents).length > 0 ? { agents: customAgents } : {}),
     appendSystemPrompt: [
       isLingModelTag(currentModel) ? LINGMODEL_IDENTITY_DIRECTIVE : null,
       NARRATION_DIRECTIVE,
+      LINGCODE_ABOUT_DIRECTIVE,
+      LINGCODE_IDE_SURFACES_DIRECTIVE,
       customAppendSystemPrompt || null,
     ].filter(Boolean).join('\n\n'),
     canUseTool: createPermissionHandler(queryId, permissionMode),
@@ -1244,31 +1547,143 @@ async function runPrompt(command) {
   let attemptedResumeRecovery = false
   let finalResult = null
 
+  // Inactivity watchdog (see PER_QUERY_INACTIVITY_MS). Re-armed on every SDK
+  // message; if it fires the query is aborted and reported as `query_failed`,
+  // distinguished from a user cancel via `inactivityAborted`.
+  let inactivityTimer = null
+  let inactivityAborted = false
+  // Indices of tool_use content blocks currently being generated. While any is
+  // open the model is provably mid-generation (a big Write etc.), so the timer
+  // uses the generous TOOL_GEN_INACTIVITY_MS instead of the normal ceiling.
+  const openToolBlocks = new Set()
+  // Count of tool_use blocks that have finished emitting but whose tool_result
+  // hasn't come back yet — i.e., the SDK is executing the tool and the stream
+  // is legitimately silent. Cleared per-tool as tool_result blocks arrive in
+  // the next `user` message (parallel tool calls all resolve in one message).
+  // Without this, a >90s Bash call (e.g. `xcodebuild` compiling ContentView)
+  // trips PER_QUERY_INACTIVITY_MS mid-execution and aborts the query with a
+  // misleading "Claude stopped responding" — Claude was waiting on us.
+  let pendingToolResults = 0
+  const noteStreamEventForToolState = (message) => {
+    if (message?.type !== 'stream_event') return
+    const ev = message.event
+    if (!ev || typeof ev.type !== 'string') return
+    if (ev.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
+      if (typeof ev.index === 'number') openToolBlocks.add(ev.index)
+    } else if (ev.type === 'content_block_stop') {
+      // Only tool_use indices sit in openToolBlocks — text/thinking blocks
+      // aren't tracked. Closing one hands control to the tool executor.
+      if (typeof ev.index === 'number' && openToolBlocks.has(ev.index)) {
+        openToolBlocks.delete(ev.index)
+        pendingToolResults += 1
+      }
+    } else if (ev.type === 'message_stop') {
+      openToolBlocks.clear()
+    }
+  }
+  const armInactivityTimer = () => {
+    if (inactivityTimer) clearTimeout(inactivityTimer)
+    const midToolWork = openToolBlocks.size > 0 || pendingToolResults > 0
+    const ms = midToolWork ? TOOL_GEN_INACTIVITY_MS : PER_QUERY_INACTIVITY_MS
+    inactivityTimer = setTimeout(() => {
+      inactivityAborted = true
+      activeAbortController?.abort(new Error('inactivity-timeout'))
+    }, ms)
+  }
+  const clearInactivityTimer = () => {
+    if (inactivityTimer) { clearTimeout(inactivityTimer); inactivityTimer = null }
+  }
+
   try {
     let retry = true
     while (retry) {
       retry = false
       const stream = startStream(effectiveResumeId, promptInput)
+      armInactivityTimer()
       try {
         for await (const message of stream) {
           if (message && typeof message === 'object') {
             if (typeof message.session_id === 'string' && message.session_id) {
               currentSessionId = message.session_id
             }
+            // The `user` message that closes a tool-execution gap carries the
+            // tool_result blocks. Discharge one pendingToolResults per block so
+            // the watchdog drops back to the tight PER_QUERY_INACTIVITY_MS
+            // window as soon as the model regains control. Clamp at 0 so a
+            // spurious extra user message (mid-flight directive, resume) can't
+            // wedge the counter negative and re-arm the tight window.
+            if (message.type === 'user' && pendingToolResults > 0) {
+              const blocks = message.message?.content
+              if (Array.isArray(blocks)) {
+                const resultCount = blocks.reduce(
+                  (n, b) => n + (b && b.type === 'tool_result' ? 1 : 0),
+                  0,
+                )
+                if (resultCount > 0) {
+                  pendingToolResults = Math.max(0, pendingToolResults - resultCount)
+                }
+              }
+            }
             if (message.type === 'result') {
               finalResult = message
+              // Some failures (notably a model-switch that invalidates a prior
+              // thinking block's signature, or an unresolvable resume) arrive as
+              // a result with `is_error` rather than a thrown stream error, so
+              // the catch-block recovery below never sees them. Re-raise ONLY the
+              // recoverable shapes into that catch so we retry once as a fresh
+              // session. Anything else stays a normal `query_finished` result.
+              if (message.is_error && !attemptedResumeRecovery && effectiveResumeId) {
+                const resultErr = new Error(String(message.result ?? message.subtype ?? ''))
+                if (isThinkingSignatureError(resultErr) || isResumeNotFoundError(resultErr)) {
+                  throw resultErr
+                }
+              }
             }
           }
           emit({ type: 'sdk_message', queryId, message })
+          noteStreamEventForToolState(message)
+          armInactivityTimer()
         }
 
-        emit({
-          type: 'query_finished',
-          queryId,
-          sessionId: currentSessionId,
-          result: finalResult,
-        })
+        clearInactivityTimer()
+        // A non-recoverable `is_error` result (model-not-found, upstream 4xx, quota)
+        // arrives here as a normal stream end, not a thrown error — the recoverable
+        // shapes were already re-raised + retried above. Surface it as `query_failed`
+        // so the app shows an error instead of silently finishing with no reply.
+        if (finalResult && finalResult.is_error) {
+          const failMessage =
+            (typeof finalResult.result === 'string' && finalResult.result.trim()) ||
+            (typeof finalResult.subtype === 'string' && finalResult.subtype.trim()) ||
+            'The model request failed.'
+          emit({
+            type: 'query_failed',
+            queryId,
+            sessionId: currentSessionId,
+            message: failMessage,
+          })
+        } else {
+          emit({
+            type: 'query_finished',
+            queryId,
+            sessionId: currentSessionId,
+            result: finalResult,
+          })
+        }
       } catch (error) {
+        clearInactivityTimer()
+        // Inactivity abort: the stream went silent and our watchdog killed it.
+        // Surface a real failure (so the app stops the spinner and offers resume)
+        // rather than a user-cancel.
+        if (inactivityAborted) {
+          emit({
+            type: 'query_failed',
+            queryId,
+            sessionId: currentSessionId,
+            message: `Claude stopped responding (no activity for ${Math.round(PER_QUERY_INACTIVITY_MS / 1000)}s).`,
+            rss: process.memoryUsage().rss,
+          })
+          return
+        }
         // User-initiated cancel takes priority over recovery — unchanged.
         if (activeAbortController?.signal.aborted) {
           emit({
@@ -1279,22 +1694,43 @@ async function runPrompt(command) {
           })
           return
         }
-        // Auto-recovery: a stale/unresolvable resume id. Retry ONCE as a fresh
-        // session. Safe because the failure is raised before any assistant
-        // output streams or directive is injected, so nothing is lost.
-        if (!attemptedResumeRecovery && effectiveResumeId && isResumeNotFoundError(error)) {
+        // Auto-recovery: a resume that can't proceed — either a stale/unresolvable
+        // resume id, or a corrupted transcript whose thinking block has an invalid
+        // signature (run cut off mid-thinking). Retry ONCE as a fresh session.
+        // Safe because the failure is raised before any assistant output streams
+        // or directive is injected, so nothing is lost.
+        const corruptThinking = isThinkingSignatureError(error)
+        if (!attemptedResumeRecovery && effectiveResumeId &&
+            (isResumeNotFoundError(error) || corruptThinking)) {
           attemptedResumeRecovery = true
           effectiveResumeId = undefined
           currentSessionId = null
-          // Rebuild the single-use directive-wrapped prompt from the raw input.
           pendingDirectives = []
           directiveNotifyResolve = null
-          promptInput = wrapPromptWithDirectiveQueue(rawPromptInput)
+          // Rebuild a FRESH prompt: the prior attempt may have consumed a
+          // single-use async-iterable prompt (attachments). Reuse the raw string
+          // when there were none; otherwise re-derive from the command.
+          let recoveredPrompt
+          try {
+            recoveredPrompt = typeof rawPromptInput === 'string'
+              ? rawPromptInput
+              : await buildPromptInput(command)
+          } catch {
+            recoveredPrompt = rawPromptInput
+          }
+          // For corruption, re-seed the prior conversation as text so the fresh
+          // session keeps continuity (a bare "continue" otherwise loses the thread).
+          if (corruptThinking && resumeFallbackContext) {
+            recoveredPrompt = prependContextToPrompt(recoveredPrompt, resumeFallbackContext)
+          }
+          promptInput = wrapPromptWithDirectiveQueue(recoveredPrompt)
           emit({
             type: 'session_recovered',
             queryId,
-            reason: 'resume_not_found',
-            message: 'Previous session could not be resumed; continuing in a new session.',
+            reason: corruptThinking ? 'thinking_signature_corrupt' : 'resume_not_found',
+            message: corruptThinking
+              ? 'The previous response was interrupted, leaving the session unresumable. Continuing in a new session with the earlier conversation as context.'
+              : 'Previous session could not be resumed; continuing in a new session.',
           })
           retry = true
           continue
@@ -1304,10 +1740,12 @@ async function runPrompt(command) {
           queryId,
           sessionId: currentSessionId,
           message: error instanceof Error ? error.message : String(error),
+          rss: process.memoryUsage().rss,
         })
       }
     }
   } finally {
+    clearInactivityTimer()
     activeQuery = null
     activeQueryId = null
     activeAbortController = null
@@ -1403,6 +1841,9 @@ async function handleCommand(command) {
       break
     case 'session_search_response':
       await handleSessionSearchResponse(command)
+      break
+    case 'terminal_read_response':
+      await handleTerminalReadResponse(command)
       break
     case 'reset_session':
       currentSessionId = null
@@ -1731,6 +2172,7 @@ rl.on('close', () => {
   rejectAllPendingMemoryWrites('Bridge stdin closed.')
   rejectAllPendingSkillWrites('Bridge stdin closed.')
   rejectAllPendingSessionSearches('Bridge stdin closed.')
+  rejectAllPendingTerminalReads('Bridge stdin closed.')
   process.exit(0)
 })
 
@@ -1758,6 +2200,7 @@ process.on('SIGINT', () => {
   rejectAllPendingMemoryWrites('Bridge interrupted.')
   rejectAllPendingSkillWrites('Bridge interrupted.')
   rejectAllPendingSessionSearches('Bridge interrupted.')
+  rejectAllPendingTerminalReads('Bridge interrupted.')
   killBridgeDescendants('SIGTERM')
   process.exit(130)
 })
@@ -1767,6 +2210,7 @@ process.on('SIGTERM', () => {
   rejectAllPendingMemoryWrites('Bridge terminated.')
   rejectAllPendingSkillWrites('Bridge terminated.')
   rejectAllPendingSessionSearches('Bridge terminated.')
+  rejectAllPendingTerminalReads('Bridge terminated.')
   killBridgeDescendants('SIGTERM')
   process.exit(143)
 })

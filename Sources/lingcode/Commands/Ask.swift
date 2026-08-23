@@ -175,7 +175,7 @@ struct Ask: AsyncParsableCommand {
     func run() async throws {
         CLIEnvironment.apply(noColor: noColor, quiet: quiet, account: account)
         // Anonymous heartbeat — fire-and-forget, opt-out via `lingcode telemetry off`.
-        Task.detached { await TelemetryClient.shared.sendHeartbeatIfDue(version: "0.8.21") }
+        Task.detached { await TelemetryClient.shared.sendHeartbeatIfDue(version: CLIVersion.current) }
 
         // Session lifecycle hooks. SessionStart fires before any provider dispatch;
         // SessionEnd fires only on clean completion at the end of run(). Early
