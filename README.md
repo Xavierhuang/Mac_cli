@@ -13,82 +13,170 @@
 >
 > Every release lists its upstream commit in the release notes.
 
-Swift Package that builds the `lingcode` binary, a terminal companion to
-LingCode.app. Ships inside the app bundle at
-`LingCode.app/Contents/Resources/bin/lingcode`.
+`lingcode` is an agentic coding assistant for the terminal. It runs standalone —
+the tarballs on the [releases page](https://github.com/Xavierhuang/Mac_cli/releases)
+bundle their own Node runtime, so there are no prerequisites — and it also ships
+inside LingCode.app at `Contents/Resources/bin/lingcode`, where it talks to the
+running app over a Unix socket.
+
+## Install
+
+```bash
+curl -fsSL https://lingcode.dev/install-cli.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+iwr -useb https://lingcode.dev/install-cli.ps1 | iex
+```
+
+The installer detects your OS and architecture, unpacks the bundle to
+`~/.lingcode/cli`, and symlinks the binary to `~/.local/bin/lingcode`. If that
+directory is not on your `PATH` it says so. macOS builds are signed and
+notarized, so Gatekeeper will not block them.
+
+Then add a key and check the install:
+
+```bash
+lingcode auth login          # store a provider API key in the Keychain
+lingcode doctor              # node, keys, bridge, MCP servers, network
+lingcode                     # interactive session
+```
+
+`lingcode upgrade` re-runs the installer in place.
 
 ## What it does
 
-Three modes, picked automatically:
+`lingcode ask` picks its route automatically:
 
-| Situation | What `lingcode ask` does |
+| Situation | What happens |
 | --- | --- |
-| LingCode.app is running | Routes the prompt over Unix-socket IPC to the app; streams the reply. |
-| App closed, `--provider deepseek` (default) | Calls `api.deepseek.com` directly. Text-only by default; `--yolo` enables tool use (Bash/Edit/Read/…). Needs `DEEPSEEK_API_KEY`. |
-| App closed, `--provider claude` | Spawns the bundled Node bridge + `@anthropic-ai/claude-agent-sdk`. Full tool use (Bash/Edit/Read/…). Needs Node.js, `ANTHROPIC_API_KEY`, and LingCode.app installed (for `bridge.mjs`). |
+| LingCode.app is running | Routes the prompt over Unix-socket IPC to the app and streams the reply back. |
+| App closed, `--provider claude` | Spawns the bundled Node bridge and the Claude Agent SDK. Full tool use — Bash, Read, Edit, Glob, Grep, MCP. |
+| App closed, any other provider | Runs the OpenAI-compatible agent loop natively in Swift, with the same tool registry. |
 
-Other subcommands (`ping`, `open`, `status`, `watch`) only work when the
-app is running — they drive its Unix socket.
+Providers: `claude`, `openai`, `gemini`, `deepseek`, `groq`, `mistral`, `xai`,
+`together`, `openrouter`, `fireworks`, `kimi`, `qwen`, `ollama`, `lingmodel`,
+plus any OpenAI-compatible endpoint you point it at. Keys live in the macOS
+Keychain (a chmod-600 file on Linux) — see `lingcode auth`.
 
-`lingcode serve` starts a long-running HTTP server (SSE for streaming agent
-output, plain POST for permission round-trips and cancellation). It uses the
-same `AgentBridgeSession` core as `lingcode ask` — see [`lingcode serve`](#lingcode-serve)
-below.
+`ping`, `open`, `status` and `watch` require the app to be running; they drive
+its socket. Everything else works standalone.
+
+## Commands
+
+31 subcommands. `lingcode <command> --help` for detail on any of them.
+
+| | |
+| --- | --- |
+| `ask` | Send a prompt and stream the answer |
+| `repl` | Interactive multi-turn session |
+| `build` | Scaffold a project and run an autonomous build |
+| `init` | Generate a CLAUDE.md for the project |
+| `doctor` | Diagnose the environment — node, keys, bridge, MCP, network |
+| `auth` | Manage API-key credentials (incl. encrypted export/import) |
+| `config` | Get or set CLI configuration |
+| `mcp` | Manage MCP servers in this project's `.mcp.json` |
+| `plugin` | List, install or remove plugin bundles |
+| `trust` | Manage trusted projects for hook execution |
+| `worktree` | Git worktrees for parallel agent runs |
+| `history` / `export` | List past sessions; export a transcript as markdown |
+| `serve` | HTTP server exposing the agent over SSE |
+| `acp-serve` | Serve the agent over ACP on stdin/stdout |
+| `deploy` | Ship an iOS app to TestFlight or the App Store |
+| `convert` | Convert a Flutter app to native iOS, Android and macOS |
+| `generate-xcodeproj` | Build an Xcode project from a folder of Swift sources |
+| `positioning` | Maintain PRODUCT.md — the product thesis and its evidence |
+| `bridge` | Inspect or clean up Node agent-bridge subprocesses |
+| `install` / `upgrade` | Symlink into PATH; re-run the installer |
+| `open` / `ping` / `status` / `watch` | Drive a running LingCode.app |
+| `completion` | Shell completion script |
+| `telemetry` | Toggle anonymous usage telemetry |
+
+## LingCode Cloud
+
+When you are signed in to LingCode Cloud, the CLI registers a `lingcode-cloud`
+MCP server automatically — no `.mcp.json` entry needed. `lingcode doctor` lists
+it. That gives the agent a managed Postgres backend with auth, storage, email
+and serverless functions, plus tools to deploy against it.
+
+Frontend hosting is included:
+
+- **`deploy_app`** — publish a built web app and get a live URL back. You (or
+  the agent) run the project's own build; the tool packages the output directory
+  and uploads it. Creating a new public app previews first and asks for
+  confirmation; re-deploys update the same app and URL.
+- **`list_apps`** / **`rollback_app`** — see what is deployed, roll code back to
+  a retained version.
+
+Native iOS, Android and React Native projects are refused before anything is
+packaged, with the reason. Flutter, Expo, Capacitor and Ionic deploy their web
+build and say so in the preview, so it is clear that what went live is the web
+target rather than the mobile app.
 
 ## Package layout
 
 ```
-LingCodeCLI/
+.
 ├── Package.swift                       # 5.7 tools, macOS 13+
-└── Sources/
-    ├── LingCodeIPC/                    # Shared wire protocol (imported by app too)
-    │   └── IPCProtocol.swift
-    └── lingcode/
-        ├── LingCodeEntry.swift         # @main AsyncParsableCommand root
-        ├── IPCClient.swift             # Unix-socket client
-        ├── HeadlessAsk.swift           # DeepSeek headless path
-        ├── HeadlessClaude.swift        # Claude-bridge headless path
-        └── Commands/
-            ├── Ask.swift
-            ├── Install.swift
-            ├── Open.swift
-            ├── Ping.swift
-            ├── Status.swift
-            └── Watch.swift
+├── Sources/
+│   ├── LingCodeIPC/                    # Shared wire protocol (the app imports this too)
+│   │   └── IPCProtocol.swift
+│   └── lingcode/
+│       ├── LingCodeEntry.swift         # @main AsyncParsableCommand root
+│       ├── IPCClient.swift             # Unix-socket client
+│       ├── HeadlessClaude.swift        # Claude bridge path
+│       ├── HeadlessOpenAICompat.swift  # OpenAI-compatible providers
+│       ├── HeadlessCodex.swift         # Codex path
+│       ├── CloudMCP.swift              # Registers the lingcode-cloud MCP server
+│       ├── SecretStore.swift           # Keychain (macOS) / chmod-600 file (Linux)
+│       ├── CLIResources.swift          # Bundle lookup — never use Bundle.module
+│       ├── Commands/                   # One file per subcommand
+│       └── Resources/agent-bridge/     # Bundled Node bridge + MCP proxy
+└── Tests/
+    ├── LingCodeCLITests/
+    └── LingCodeIPCTests/
 ```
 
-Headless agent code (`DeepSeekClient`, `AgentBridgeSession`,
-`PermissionDecider`, `BridgeResourceLocator`) lives in the sibling
-[`LingCodeAgentCore`](../LingCodeAgentCore/) package and is consumed via
-`.package(path: "../LingCodeAgentCore")`.
+Agent internals (`AgentBridgeSession`, the OpenAI-compat loop, `MCPManager`,
+`PermissionDecider`, `BridgeResourceLocator`) live in the sibling
+`LingCodeAgentCore` package.
 
 ## Build
 
+Build from the canonical repo — the path dependencies do not resolve here.
+
 ```bash
 cd LingCodeCLI
-swift build                           # debug binary → .build/debug/lingcode
-swift build --configuration release   # release    → .build/release/lingcode
-swift test                            # 20 unit tests in LingCodeAgentCore
+swift build                           # debug   → .build/debug/lingcode
+swift build --configuration release   # release → .build/release/lingcode
+swift test                            # LingCodeCLITests + LingCodeIPCTests
 ```
 
-The release binary is what `ship.sh` copies into
-`LingCode.app/Contents/Resources/bin/lingcode` and codesigns.
+Cutting a release tarball (signed and notarized, both architectures):
 
-## Running locally (no app shipped)
+```bash
+SIGN_AND_NOTARIZE=1 ./scripts/build-cli-standalone.sh <version> arm64
+SIGN_AND_NOTARIZE=1 ./scripts/build-cli-standalone.sh <version> x86_64
+```
 
-Point the Claude bridge locator at your dev `agent-bridge/` directory:
+That embeds a universal Node runtime so the tarball has no prerequisites, and
+re-syncs `agent-bridge/` from the app source, which is its source of truth.
+
+## Running from a dev build
 
 ```bash
 export LINGCODE_AGENT_BRIDGE_DIR="$PWD/../LingCode/agent-bridge"
 export ANTHROPIC_API_KEY=sk-ant-...
-.build/debug/lingcode ask --headless --provider claude --yolo "summarise this repo"
+.build/debug/lingcode ask --provider claude "summarise this repo"
 ```
 
-Or for the DeepSeek path, no bridge is needed:
+Any OpenAI-compatible provider needs no bridge:
 
 ```bash
 export DEEPSEEK_API_KEY=sk-...
-.build/debug/lingcode ask --headless "what is in this directory?"
+.build/debug/lingcode ask --provider deepseek "what is in this directory?"
 ```
 
 ## Adding a subcommand
@@ -158,7 +246,7 @@ and any OpenAI-compatible (`openai`, `groq`, `together`, `openrouter`,
 keychain → config-file fallback `lingcode ask` uses.
 
 Bind / TLS / CORS notes and the full endpoint reference live in
-[`LingCodeServer/README.md`](../LingCodeServer/README.md).
+[`LingCodeServer/README.md`](https://github.com/Xavierhuang/LingCode/blob/main/LingCodeServer/README.md).
 
 ## Wire protocol
 
@@ -168,9 +256,9 @@ The socket is at `~/Library/Application Support/LingCode/ipc.sock`.
 
 The Claude bridge protocol (Swift ↔ Node) is documented by the event
 and command types in
-[`AgentBridgeSession.swift`](../LingCodeAgentCore/Sources/LingCodeAgentCore/AgentBridgeSession.swift)
+[`AgentBridgeSession.swift`](https://github.com/Xavierhuang/LingCode/blob/main/LingCodeAgentCore/Sources/LingCodeAgentCore/AgentBridgeSession.swift)
 and the command dispatcher in
-[`bridge.mjs`](../LingCode/agent-bridge/bridge.mjs).
+[`bridge.mjs`](https://github.com/Xavierhuang/LingCode/blob/main/LingCode/agent-bridge/bridge.mjs).
 
 ## License
 
