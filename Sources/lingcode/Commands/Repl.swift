@@ -85,7 +85,7 @@ struct Repl: AsyncParsableCommand {
           ← / → / Home / End Move cursor
           Tab               Complete slash commands
           Trailing `\\`      Continue the input on the next line
-          Ctrl-C            Cancel running query (claude) / abort line
+          Ctrl-C            Cancel running query; at an idle prompt press twice to exit
           Ctrl-D            Exit on empty line; otherwise delete char
         """
     )
@@ -150,7 +150,7 @@ struct Repl: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable Claude's extended thinking mode.")
     var thinking: Bool = false
 
-    @Option(name: .long, help: "Provider: claude (default) | deepseek-claude | openai | gemini | kimi | qwen | groq | together | openrouter | mistral | xai | fireworks | ollama | deepseek-compat.")
+    @Option(name: .long, help: "Provider: lingmodel (hosted — sign in, no key) | claude (default) | deepseek-claude | openai | gemini | kimi | qwen | groq | together | openrouter | mistral | xai | fireworks | ollama | deepseek-compat.")
     var provider: String?
 
     @Option(name: .long, help: "Base URL override for OpenAI-compatible providers.")
@@ -300,6 +300,22 @@ struct Repl: AsyncParsableCommand {
                 currentModel = "deepseek-v4-pro[1m]"
             }
         }
+        if isLingModel {
+            // bridge.mjs derives its `currentModel` from LINGCODE_CLAUDE_MODEL at
+            // startup, or from a later set_model — NEVER from the per-query command
+            // (it reads command.model only in the set_model handler). And only a
+            // `lingmodel*` tag makes applyProviderEnv swap ANTHROPIC_AUTH_TOKEN to
+            // the managed proxy's bearer.
+            //
+            // Leaving this unset is why every hosted request 401'd regardless of the
+            // token: currentModel stayed null, that branch never ran, and the bridge
+            // fell through to the restore branch with no proxy bearer. The Mac app
+            // (ClaudeCodeAgentService) and LingCodeServer (AgentAskACPHandler) have
+            // always pinned a tag here; the CLI was the one surface that didn't.
+            if currentModel?.hasPrefix("lingmodel") != true {
+                currentModel = LingModelAuth.defaultModelTag
+            }
+        }
         // --agent <name> resolves before model/tools so the agent can override them.
         let loadedAgent: Subagent?
         if let name = agent, !name.isEmpty {
@@ -435,7 +451,38 @@ struct Repl: AsyncParsableCommand {
             throw ExitCode(1)
         }
 
-        let mcpServers = mcp ? MCPConfig.load(cwd: cwd, overridePath: mcpConfig) : [:]
+        // Preflight the hosted token. A LingModel credential is server-side state
+        // that can be revoked out from under this machine (expiry, explicit revoke,
+        // or the active-token cap retiring the oldest), so "we found one" is not
+        // "it works". Without this the first prompt of the session is spent
+        // discovering that, and the failure surfaces as a raw proxy 401 with no
+        // recovery path. ~250ms against a route that costs no quota.
+        //
+        // Deliberately NOT fatal: /login can fix it from inside the session now,
+        // and a network blip must not stop the REPL from starting.
+        if isLingModel {
+            switch LingModelAuth.probe(token: key) {
+            case .rejected:
+                let warning = """
+                    ⚠ Your LingModel token was rejected by the server (expired, revoked, or \
+                    retired by the active-token cap).
+                      Every prompt will fail with a 401 until it's replaced. Type /login to fix it here, \
+                    or mint a new token at \(LingModelAuth.mintURL).
+
+                    """
+                FileHandle.standardError.write(Data(
+                    ANSI.styled(warning, ANSI.yellow, fd: STDERR_FILENO).utf8
+                ))
+            case .valid, .rateLimited, .unreachable:
+                // .unreachable says nothing about the token — stay quiet rather
+                // than crying wolf on an offline start.
+                break
+            }
+        }
+
+        let mcpServers = mcp
+            ? mergingCloudMCP(MCPConfig.load(cwd: cwd, overridePath: mcpConfig), cwd: cwd)
+            : [:]
         let hooks = HooksConfig.load(cwd: cwd)
         let expandedAddDirs = addDir.map { ($0 as NSString).expandingTildeInPath }
 
@@ -476,7 +523,18 @@ struct Repl: AsyncParsableCommand {
             // (server may still downgrade by plan). The proxy accepts x-api-key (which the Anthropic
             // SDK sends from ANTHROPIC_API_KEY) and treats it as bearer
             // when it starts with the lcat_ prefix.
-            bridgeExtraEnv["ANTHROPIC_BASE_URL"] = "https://lingcode.dev/api/inference/anthropic"
+            bridgeExtraEnv["ANTHROPIC_BASE_URL"] = LingModelAuth.inferenceBaseURL
+            // LINGCODE_PROXY_* is what arms the bridge's `applyProviderEnv` LingModel
+            // branch. Without them `proxyBaseURL` is null, that branch is skipped, and
+            // every set_model falls through to the restore branch that reinstates the
+            // ORIGINAL spawn-time key — which makes a live `/login` silently no-op.
+            // The Mac app has always set these (ClaudeCodeAgentService.swift); the CLI
+            // not doing so was the only reason the two paths differed.
+            bridgeExtraEnv["LINGCODE_PROXY_BASE_URL"] = LingModelAuth.inferenceBaseURL
+            bridgeExtraEnv["LINGCODE_PROXY_AUTH_TOKEN"] = key
+            // The tag pinned above. This is what actually arms the proxy branch —
+            // the model in the query command is ignored by the bridge.
+            bridgeExtraEnv["LINGCODE_CLAUDE_MODEL"] = resolvedModel ?? LingModelAuth.defaultModelTag
             // Default to LingModel Standard (`lingmodel-standard`; legacy `lingmodel-fast` still works) unless --model overrides.
             // The bridge maps tags to upstream ids (e.g. kimi-k2.5 / kimi-k2.6 for hosted tiers).
             bridgeExtraEnv["ANTHROPIC_DEFAULT_OPUS_MODEL"]   = "lingmodel-advanced"
@@ -539,11 +597,26 @@ struct Repl: AsyncParsableCommand {
         // SIGINT handler: cancel active query instead of killing process
         let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         let queryActive = AtomicBool(false)
+        // Deadline for the "press again" window, as a reference-date interval.
+        // Idle Ctrl-C used to exit(130) on the FIRST press, so one stray keystroke
+        // at the prompt ended the session and took the transcript with it. The
+        // terminal is never in raw mode for the main prompt (only TTYIO's pickers
+        // use termios), so every Ctrl-C reaches this handler — there is no line
+        // editor upstream to absorb an accidental press.
+        let exitArmedUntil = AtomicExitDeadline()
+        // 5s, not 2s. The window has to cover a human reading "Press Ctrl-C again"
+        // and then reaching for the key — 2s expired mid-reach, so the second press
+        // re-armed instead of exiting and the REPL demanded a third. Automated
+        // tests never caught it because they fire the presses microseconds apart.
+        let ctrlCGraceSeconds: TimeInterval = 5
         signal(SIGINT, SIG_IGN)
         sigintSource.setEventHandler {
             if queryActive.value {
                 Task { await session.cancel() }
-            } else {
+                // Cancelling is not a step toward exiting: returning to the prompt
+                // starts a fresh window, so cancel-then-stray-Ctrl-C can't quit.
+                exitArmedUntil.clear()
+            } else if exitArmedUntil.isArmed(at: Date().timeIntervalSinceReferenceDate) {
                 Task {
                     await session.shutdown()
                     // ParsableCommand has its own static `exit`, so bare `exit`
@@ -555,6 +628,12 @@ struct Repl: AsyncParsableCommand {
                     Glibc.exit(130)
                     #endif
                 }
+            } else {
+                exitArmedUntil.arm(until: Date().timeIntervalSinceReferenceDate + ctrlCGraceSeconds)
+                let notice = ANSI.styled(
+                    "\nPress Ctrl-C again to exit (or /quit)\n", ANSI.yellow, fd: STDERR_FILENO
+                )
+                FileHandle.standardError.write(Data(notice.utf8))
             }
         }
         sigintSource.resume()
@@ -655,9 +734,32 @@ struct Repl: AsyncParsableCommand {
                     switch editor.readLine(prompt: promptStr) {
                     case .line(let s):      chunk = s
                     case .eof:              chunk = nil
-                    case .interrupted:
+                    case .interrupted(let hadInput):
+                        // The SIGINT handler installed above NEVER sees a Ctrl-C
+                        // typed at this prompt: LineEditor puts the terminal in raw
+                        // mode (ISIG cleared), so the keystroke arrives as byte 0x03
+                        // and lands here instead. That handler only fires for piped
+                        // stdin. Mirror its double-tap policy so a real terminal
+                        // behaves the same — previously this branch just redrew the
+                        // prompt, so Ctrl-C could never exit the REPL at all.
                         assembled = ""
                         firstLine = true
+                        // Discarding typed text is a complete action on its own; it
+                        // must not also count as a step toward quitting, or clearing
+                        // a line twice would drop the user out of the session.
+                        if hadInput {
+                            exitArmedUntil.clear()
+                            continue readOneInput
+                        }
+                        let now = Date().timeIntervalSinceReferenceDate
+                        if exitArmedUntil.isArmed(at: now) {
+                            await session.shutdown()
+                            return
+                        }
+                        exitArmedUntil.arm(until: now + ctrlCGraceSeconds)
+                        FileHandle.standardError.write(Data(ANSI.styled(
+                            "Press Ctrl-C again to exit (or /quit)\n", ANSI.yellow, fd: STDERR_FILENO
+                        ).utf8))
                         continue readOneInput
                     }
                 } else if let tty = tty {
@@ -686,6 +788,9 @@ struct Repl: AsyncParsableCommand {
             let _dbg = ProcessInfo.processInfo.environment["LINGCODE_DEBUG_BRIDGE"] == "1"
             if _dbg { FileHandle.standardError.write(Data("[repl] input=\(input)\n".utf8)) }
             guard !input.isEmpty else { continue }
+            // Submitting a line is unambiguous intent to keep working, so a stale
+            // arm must not survive it and let a single later Ctrl-C quit outright.
+            exitArmedUntil.clear()
             lineEditor?.addHistory(input)
 
             // /compact is special: it sends a query and must drain events like a normal turn.
@@ -913,7 +1018,7 @@ struct Repl: AsyncParsableCommand {
                         startSpinner("running tool…")
                     }
 
-                case .queryFinished(let sid, _):
+                case .queryFinished(let sid, _, _):
                     stopSpinner()
                     // Flush buffered markdown
                     let flushed = mdRenderer.flush()
@@ -1034,24 +1139,85 @@ struct Repl: AsyncParsableCommand {
                     }
                     throw ExitCode(code != 0 ? 1 : 0)
 
-                case .ready, .queryStarted:
+                case .ready, .queryStarted, .awaitingFirstMessage:
                     break
 
                 case .userInputRequested(let request):
-                    // The REPL has no interactive option picker yet — decline so
-                    // the turn continues instead of parking in the bridge's
-                    // canUseTool gate. (The Mac Claude tab answers these natively.)
-                    let q = request.questions.first?.question ?? "a multiple-choice question"
-                    FileHandle.standardError.write(Data(
-                        "(Claude asked: \(q) — not interactively answerable in the REPL yet; declining)\n".utf8
-                    ))
-                    await session.respondToUserInput(requestId: request.id, answers: [:], cancelled: true)
+                    // Render the option picker inline and read the choice from stdin.
+                    //
+                    // This used to decline unconditionally, which dead-ended any skill
+                    // that asks a question — `ship-ios-app` stops on "API key or
+                    // Apple ID?" and the whole turn was abandoned at that point. The
+                    // bridge is parked in canUseTool waiting for us, so a plain
+                    // readLine() here is safe: nothing else is consuming stdin.
+                    //
+                    // Non-interactive stdin (piped input, CI) still declines — there
+                    // is nobody to ask, and blocking on a read that never returns
+                    // would hang the run.
+                    if isatty(fileno(stdin)) == 0 {
+                        let q = request.questions.first?.question ?? "a multiple-choice question"
+                        FileHandle.standardError.write(Data(
+                            "(Claude asked: \(q) — stdin is not a terminal; declining)\n".utf8
+                        ))
+                        await session.respondToUserInput(requestId: request.id, answers: [:], cancelled: true)
+                        break
+                    }
+
+                    var answers: [String: String] = [:]
+                    var abandoned = false
+                    for question in request.questions {
+                        Swift.print("")
+                        Swift.print(question.header.isEmpty ? "Claude asks:" : "\(question.header):")
+                        Swift.print("  \(question.question)")
+                        for (i, opt) in question.options.enumerated() {
+                            Swift.print("    \(i + 1)) \(opt.label)")
+                            if !opt.description.isEmpty {
+                                Swift.print("       \(opt.description)")
+                            }
+                        }
+                        let hint = question.multiSelect
+                            ? "  Choose (comma-separated numbers), type your own, or Enter to skip: "
+                            : "  Choose a number, type your own, or Enter to skip: "
+                        FileHandle.standardOutput.write(Data(hint.utf8))
+                        guard let raw = readLine(strippingNewline: true) else { abandoned = true; break }
+                        let entry = raw.trimmingCharacters(in: .whitespaces)
+                        if entry.isEmpty { abandoned = true; break }
+
+                        // Numbers map to option labels; anything else is passed through
+                        // verbatim, which is what the "Other" affordance amounts to.
+                        let picked = entry
+                            .split(separator: ",")
+                            .map { $0.trimmingCharacters(in: .whitespaces) }
+                            .map { token -> String in
+                                if let n = Int(token), n >= 1, n <= question.options.count {
+                                    return question.options[n - 1].label
+                                }
+                                return token
+                            }
+                        answers[question.question] = picked.joined(separator: ", ")
+                    }
+
+                    if abandoned || answers.isEmpty {
+                        FileHandle.standardError.write(Data("(skipped)\n".utf8))
+                        await session.respondToUserInput(requestId: request.id, answers: [:], cancelled: true)
+                    } else {
+                        await session.respondToUserInput(requestId: request.id, answers: answers, cancelled: false)
+                    }
 
                 case .sdkMessage, .subagentStarted, .subagentFinished, .sessionRecovered,
                      .memoryWriteRequest, .skillWriteRequest, .sessionSearchRequest, .terminalReadRequest:
                     break
                 }
             }
+            // Backstop: every `break drainLoop` above clears this, but the loop can
+            // also end by the event stream simply running dry — no queryCompleted,
+            // queryFailed, queryCancelled or bridgeExited to trigger those. That
+            // path left the flag TRUE while the user sat back at an idle prompt, and
+            // a stuck-true flag routes Ctrl-C into the cancel branch forever: it
+            // cancels a query that isn't running, prints nothing, and never exits,
+            // so Ctrl-C stops quitting the REPL entirely. Reset unconditionally on
+            // the way back to the prompt.
+            queryActive.set(false)
         }
 
         await session.shutdown()
@@ -1067,6 +1233,44 @@ struct Repl: AsyncParsableCommand {
     }
 
     // MARK: - Slash commands
+
+    /// Push a freshly-minted token into the ALREADY-RUNNING bridge.
+    ///
+    /// The bridge spawns with its credential in env, so a keychain write alone
+    /// would not reach it — the session would keep 401ing until relaunch. Its
+    /// `set_model` handler reassigns `proxyAuthToken` and re-runs
+    /// `applyProviderEnv`, which is the whole mechanism; we just have to send it.
+    ///
+    /// The model must be sent too: the bridge assigns `currentModel` from
+    /// `command.model` unconditionally, so omitting it would null out the model
+    /// as a side effect of re-authing.
+    /// Returns the model tag actually pushed, so the caller can keep its own
+    /// `currentModel` in sync with what the bridge now holds. nil on failure.
+    private func pushLiveToken(
+        _ token: String,
+        session: AgentBridgeSession,
+        model: String?,
+        colorEnabled: Bool
+    ) async -> String? {
+        // Must run even when the REPL has no explicit model. An earlier version
+        // bailed in that case, assuming the next prompt would pick the new token up
+        // from the keychain — it does not. The bridge subprocess is already running
+        // with the OLD credential in its env and never re-reads the keychain, so
+        // skipping the push left the session 401ing behind a "✓ saved". Fall back to
+        // the tag the bridge resolves to anyway; `isLingModelTag` must accept it or
+        // `applyProviderEnv` skips the branch that swaps the token.
+        let target = (model?.isEmpty == false) ? model! : LingModelAuth.defaultModelTag
+        do {
+            try await session.setModel(target, proxyAuthToken: token)
+            Swift.print(ANSI.styled("✓ session re-authed — keep going, no restart needed", ANSI.green, fd: STDOUT_FILENO))
+            return target
+        } catch {
+            // Saved but not hot-swapped: say so precisely. Claiming success here
+            // would send the user back into the same 401 loop they just escaped.
+            printError("token saved, but this session could not be re-authed live (\(error)) — /quit and relaunch to pick it up", colorEnabled: colorEnabled)
+            return nil
+        }
+    }
 
     private func handleSlashCommand(
         _ raw: String,
@@ -1110,6 +1314,8 @@ struct Repl: AsyncParsableCommand {
               /agents         List subagents discovered in .claude/agents/
               /output-styles  List output styles (built-in + .claude/output-styles/)
               /doctor         Diagnose the LingCode environment
+              /login [token]  Replace the LingModel token and re-auth this session live
+              /logout         Remove the stored LingModel token
               /export [path]  Save transcript as markdown (default: ./lingcode-transcript-*.md)
               /init           Generate a CLAUDE.md for the current project
               /reset          Start a fresh conversation (clears session)
@@ -1119,6 +1325,14 @@ struct Repl: AsyncParsableCommand {
 
             Custom slash commands from .claude/commands/<name>.md are invoked as
               /project:<name>, /user:<name>, or bare /<name>.
+
+            Input editor (when stdin is a TTY):
+              ↑ / ↓             Recall previous / next input
+              ← / → / Home / End Move cursor
+              Tab               Complete slash commands
+              Trailing `\\`      Continue the input on the next line
+              Ctrl-C            Cancel running query; at an idle prompt press twice to exit
+              Ctrl-D            Exit on empty line; otherwise delete char
 
             """
             Swift.print(help)
@@ -1323,6 +1537,71 @@ struct Repl: AsyncParsableCommand {
         case "doctor":
             await runDoctor(cwd: cwd)
 
+        case "login":
+            // Re-auth the hosted provider without losing the session. Before this
+            // existed, a revoked token meant every prompt 401'd and the only way
+            // out was /quit → `lingcode auth login` → relaunch, discarding the
+            // transcript. Accepts `/login <token>` for paste-in-one-go, but
+            // prefers the /dev/tty prompt so the token stays out of scrollback
+            // and out of the REPL's own history.
+            let liActive = CLIEnvironment.resolvedAccount(forProvider: "lingmodel")
+            let entered: String
+            if let arg = arg, !arg.isEmpty {
+                entered = arg
+            } else if let tty = tty {
+                Swift.print("Mint a token at \(LingModelAuth.mintURL), then paste it here.")
+                tty.write("LingModel token: ")
+                entered = tty.readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            } else {
+                printError("/login needs a TTY — pass the token directly: /login <token>", colorEnabled: colorOn)
+                return true
+            }
+            guard !entered.isEmpty else {
+                Swift.print(ANSI.styled("no token entered — nothing changed", ANSI.dim, fd: STDOUT_FILENO))
+                return true
+            }
+            // Verify BEFORE persisting. Writing an unverified token would swap a
+            // known-dead credential for a possibly-dead one and still report ✓.
+            let acceptedNote: String
+            switch LingModelAuth.probe(token: entered) {
+            case .rejected:
+                printError("that token was rejected by the server — nothing saved. Mint a fresh one at \(LingModelAuth.mintURL)", colorEnabled: colorOn)
+                return true
+            case .unreachable:
+                printError("could not reach the server to verify that token — nothing saved. Check your connection and retry.", colorEnabled: colorOn)
+                return true
+            case .valid(let tier):
+                acceptedNote = tier.map { " (tier=\($0))" } ?? ""
+            case .rateLimited:
+                acceptedNote = " (currently rate-limited)"
+            }
+            do {
+                try LingModelAuth.save(token: entered, account: liActive)
+            } catch {
+                printError("token verified but could not be saved to the keychain: \(error)", colorEnabled: colorOn)
+                return true
+            }
+            Swift.print(ANSI.styled("✓ token valid\(acceptedNote) and saved", ANSI.green, fd: STDOUT_FILENO))
+            let modelForPush = currentModel
+            if let pushed = await pushLiveToken(entered, session: session, model: modelForPush, colorEnabled: colorOn) {
+                // Keep the REPL's view aligned with what the bridge now holds —
+                // set_model assigns currentModel there unconditionally.
+                currentModel = pushed
+            }
+
+        case "logout":
+            // Clears the stored credential. Does NOT tear down the running bridge:
+            // the already-spawned subprocess keeps its copy, so we say plainly that
+            // this session stays authed rather than implying a revoke we can't do.
+            let loActive = CLIEnvironment.resolvedAccount(forProvider: "lingmodel")
+            do {
+                try LingModelAuth.delete(account: loActive)
+                Swift.print(ANSI.styled("✓ LingModel token removed from the keychain", ANSI.green, fd: STDOUT_FILENO))
+                Swift.print(ANSI.styled("  this session keeps working until you quit; new sessions will need /login", ANSI.dim, fd: STDOUT_FILENO))
+            } catch {
+                printError("could not remove the stored token: \(error)", colorEnabled: colorOn)
+            }
+
         case "export":
             // /export [path]  — write transcript markdown. Defaults to ./lingcode-transcript-<ts>.md
             let target: URL = {
@@ -1468,6 +1747,13 @@ struct Repl: AsyncParsableCommand {
         if m.contains("gemini-2.5") { return 2_000_000 }
         if m.contains("gemini-3") { return 2_000_000 }
         if m.contains("gemini") { return 1_000_000 }
+        // GPT-5.6 family and GPT-6 Astra: 1.05M context, 128K max output.
+        // MUST precede the gpt-4o / o1 lines — those are `contains` scans and
+        // "gpt-5.6-sol" would not hit them, but keeping the newest first is the
+        // convention that stopped this table going stale before.
+        if m.contains("gpt-6")      { return 1_050_000 }
+        if m.contains("gpt-5.6")    { return 1_050_000 }
+        if m.contains("gpt-5")      { return 400_000 }
         if m.contains("gpt-4.1")    { return 1_000_000 }
         if m.contains("gpt-4o")     { return 128_000 }
         if m.contains("o1")         { return 200_000 }
@@ -1491,6 +1777,9 @@ struct Repl: AsyncParsableCommand {
         case .queryStarted(let id):
             obj["type"] = "query_started"
             obj["query_id"] = id
+        case .awaitingFirstMessage(let id):
+            obj["type"] = "query_awaiting_first_message"
+            obj["query_id"] = id
         case .assistantText(let t):
             obj["type"] = "assistant_text"
             obj["text"] = t
@@ -1510,7 +1799,7 @@ struct Repl: AsyncParsableCommand {
             obj["type"] = "permission_resolved"
             obj["request_id"] = id
             obj["behavior"] = behavior
-        case .queryFinished(let sid, let res):
+        case .queryFinished(let sid, let res, _):
             obj["type"] = "query_finished"
             if let s = sid { obj["session_id"] = s }
             if let r = res { obj["result_text"] = r }

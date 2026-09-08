@@ -44,10 +44,10 @@ async function buildUserContent(prompt, imagePaths) {
 }
 
 const DEFAULT_MODELS = {
-  openai: 'gpt-4o-mini',
+  openai: 'gpt-5.6-sol',
   groq: 'llama-3.3-70b-versatile',
   together: 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo',
-  openrouter: 'openai/gpt-4o-mini',
+  openrouter: 'openai/gpt-5.6-sol',
   mistral: 'mistral-large-latest',
   xai: 'grok-2-latest',
   fireworks: 'accounts/fireworks/models/llama-v3p1-70b-instruct',
@@ -124,7 +124,7 @@ export async function streamOpenAICompat({
   maxIterations = 16,
 }) {
   const baseURL = meta.baseURL
-  const model = modelOverride || process.env.LINGCODE_OPENAI_MODEL || DEFAULT_MODELS[meta.name] || 'gpt-4o-mini'
+  const model = modelOverride || process.env.LINGCODE_OPENAI_MODEL || DEFAULT_MODELS[meta.name] || 'gpt-5.6-sol'
   const url = `${baseURL.replace(/\/$/, '')}/chat/completions`
 
   // UserPromptSubmit hook gate. If a hook blocks, we surface the reason and

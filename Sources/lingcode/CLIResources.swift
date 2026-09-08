@@ -24,15 +24,36 @@ enum CLIResources {
         }
     }
 
+    /// The directory that actually CONTAINS the resources — not merely the bundle
+    /// directory.
+    ///
+    /// SwiftPM emits the resource bundle in two shapes depending on how it was built:
+    /// flat, with `agent-bridge/` at the bundle root, or as a structured macOS bundle
+    /// with everything under `Contents/Resources/`. Every caller appends a path like
+    /// `agent-bridge/node` to whatever this returns, so returning the bundle root for
+    /// a structured bundle makes all of them miss.
+    ///
+    /// The symptom is quiet rather than fatal, which is why it survived: each caller
+    /// falls back to something that usually exists on a developer's machine. `lingcode
+    /// doctor` on a structured install reported a Homebrew node and LingCode.app's
+    /// bridge, both green — while the CLI's own bundled copies sat unused two
+    /// directories away. On a machine with neither, the standalone tarball simply
+    /// does not work, which is the one thing it exists to guarantee.
     static func bundleURL() throws -> URL {
         var searched: [String] = []
+        let fm = FileManager.default
         for dir in candidateExecDirs() {
             for name in ["LingCodeCLI_lingcode.bundle", "LingCodeCLI_lingcode.resources"] {
                 let path = (dir as NSString).appendingPathComponent(name)
                 searched.append(path)
-                if FileManager.default.fileExists(atPath: path) {
-                    return URL(fileURLWithPath: path)
+                guard fm.fileExists(atPath: path) else { continue }
+                let root = URL(fileURLWithPath: path)
+                // Structured bundle: descend to where the payload really lives.
+                let contents = root.appendingPathComponent("Contents/Resources")
+                if fm.fileExists(atPath: contents.appendingPathComponent("agent-bridge").path) {
+                    return contents
                 }
+                return root
             }
         }
         throw LookupError.bundleMissing(searched: searched)

@@ -59,7 +59,11 @@ struct LingCode: AsyncParsableCommand {
                 try command.run()
             }
         } catch {
-            if let first = argv.first, !first.hasPrefix("-") {
+            // Only hint when the first argument genuinely isn't a subcommand. Without
+            // the `isKnownSubcommand` guard this also fired for a BAD OPTION on a GOOD
+            // subcommand — `lingcode ship --nope` printed "'ship' is not a known
+            // subcommand. Did you mean 'ship'?" above the real error.
+            if let first = argv.first, !first.hasPrefix("-"), !isKnownSubcommand(first) {
                 let msg = String(describing: error).lowercased()
                 if msg.contains("unknown") || msg.contains("unexpected"),
                    let suggestion = closestSubcommandName(to: first) {
@@ -134,6 +138,15 @@ internal func parseGotoArgument(_ arg: String) -> (path: String, line: Int?, col
     return nil
 }
 #endif
+
+/// True when `name` is an actual registered subcommand.
+@available(macOS 10.15, macCatalyst 13, iOS 13, tvOS 13, watchOS 6, *)
+private func isKnownSubcommand(_ name: String) -> Bool {
+    let lower = name.lowercased()
+    return subcommandList().contains {
+        ($0.configuration.commandName ?? String(describing: $0).lowercased()) == lower
+    }
+}
 
 /// Returns the subcommand name nearest to `name` (Levenshtein ≤ 3) or nil.
 /// Powers the `did you mean…` suggestion when a user mistypes a subcommand.
@@ -211,6 +224,10 @@ fileprivate func subcommandList() -> [ParsableCommand.Type] {
     ])
     if #available(macOS 13, *) {
         cmds.append(Serve.self)
+        // The release-pipeline commands — ship, submit, play, screenshots —
+        // are registered here upstream. They are not part of this public source
+        // mirror, so their registrations are omitted to keep this tree
+        // self-consistent. See README: canonical source is Xavierhuang/LingCode.
     }
     cmds.append(AcpServe.self)
     #endif

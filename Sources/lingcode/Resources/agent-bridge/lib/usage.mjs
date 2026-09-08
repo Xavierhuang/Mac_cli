@@ -10,11 +10,12 @@
 const PRICING = {
   // Anthropic — Opus 4.6+ dropped to $5/$25 (was $15/$75 on Opus 4.x originals).
   // Verified against https://platform.claude.com/docs/en/about-claude/models/overview
-  // Claude 5 generation pricing is a best-effort placeholder pending an
-  // official rate on the pricing page — the token counts stay accurate
-  // either way; only the USD display column is affected by drift here.
-  'claude-opus-5':          { in: 15.00, out: 75.00 },
+  // Fable 5.1 matches Fable 5 on input/output; its headline saving is a $0.25/M
+  // cache-read rate, which this table doesn't model (no cache-token column).
+  'claude-fable-5-1':       { in: 10.00, out: 50.00 },
   'claude-fable-5':         { in: 10.00, out: 50.00 },
+  'claude-opus-5':          { in: 5.00,  out: 25.00 },
+  'claude-sonnet-5':        { in: 2.00,  out: 10.00 },
   'claude-opus-4-8':        { in: 5.00,  out: 25.00 },
   'claude-opus-4-7':        { in: 5.00,  out: 25.00 },
   'claude-opus-4-6':        { in: 5.00,  out: 25.00 },
@@ -29,6 +30,11 @@ const PRICING = {
   'claude-3-5-haiku':       { in: 0.80,  out: 4.00 },
 
   // OpenAI
+  // Verified 2026-09-07; GPT-5.6 rates promotional through >= 2026-11-21.
+  'gpt-6-astra':            { in: 10.00, out: 50.00 },
+  'gpt-5.6-sol':            { in: 4.00,  out: 20.00 },
+  'gpt-5.6-terra':          { in: 2.00,  out: 12.00 },
+  'gpt-5.6-luna':           { in: 0.20,  out: 1.20 },
   'gpt-4o':                 { in: 2.50,  out: 10.00 },
   'gpt-4o-mini':            { in: 0.15,  out: 0.60 },
   'gpt-4.1':                { in: 2.00,  out: 8.00 },

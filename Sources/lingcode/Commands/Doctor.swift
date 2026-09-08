@@ -34,12 +34,20 @@ enum DoctorReport {
         Swift.print(ANSI.styled("LingCode doctor — \(version())", ANSI.bold, fd: STDOUT_FILENO))
 
         // — Node toolchain
+        // Say WHICH node this is, not just that one exists. A tarball install that
+        // silently falls back to a system node looks identical to a healthy one here,
+        // and that is exactly how a resource-layout bug survived: doctor reported a
+        // green Homebrew node while the CLI's own bundled copy sat unused. On a
+        // machine with no system node — the machine this tarball exists for — the
+        // same install simply does not run.
         let bundledNode = CLIResources.bundledNodePath()
         if let n = NodeResolver.resolve(extraSearchPaths: [bundledNode].compactMap { $0 }) {
             if let bundledNode, n == bundledNode {
                 ok("node: \(n) (bundled)")
+            } else if bundledNode == nil {
+                warn("node: \(n) (system — this install has no bundled runtime, so it depends on your PATH)")
             } else {
-                ok("node: \(n)")
+                ok("node: \(n) (system — bundled runtime also present)")
             }
         } else {
             if bundledNode == nil {
@@ -65,9 +73,47 @@ enum DoctorReport {
                 ok("\(label) key: keychain\(actLabel)")
             } else if !(configValue ?? "").isEmpty {
                 ok("\(label) key: config\(actLabel)")
+            } else if label == "anthropic", let sub = ClaudeSubscriptionAuth.detect() {
+                // A Pro/Max subscriber has no API key and needs none. Reporting a red
+                // ✗ here sent them to buy metered credits they already had covered.
+                ok("anthropic: \(sub.describedForDoctor) — no API key needed")
             } else {
                 bad("\(label) key: not configured\(actLabel) — `lingcode auth login --provider \(label)`")
             }
+        }
+
+        // — LingModel hosted token. Kept out of the loop above: it has its own env
+        // var and no ConfigStore fallback, but mainly because presence is not health
+        // here. A vendor API key is valid until the user rotates it; a LingModel
+        // token is server-side state that can be revoked out from under the machine
+        // holding it — expiry, an explicit revoke, or the active-token cap silently
+        // retiring the oldest (account-tokens.js `active_token_cap_exceeded`). A
+        // green ✓ on mere presence is exactly how a dead credential on the DEFAULT
+        // provider passed this check while every `lingcode` run 401'd. So verify it.
+        let lmActive = cfg.activeAccountName(for: "lingmodel")
+        let lmActLabel = lmActive.map { " (account=\($0))" } ?? ""
+        let lmIsDefault = cfg.defaultProvider.lowercased() == "lingmodel"
+
+        if let (lmToken, lmSource) = LingModelAuth.resolveToken(account: lmActive) {
+            if !includeNetwork {
+                neutral("lingmodel token: \(lmSource)\(lmActLabel) — present but NOT verified (--no-network)")
+            } else {
+                switch LingModelAuth.probe(token: lmToken) {
+                case .valid(let tier):
+                    ok("lingmodel token: \(lmSource)\(lmActLabel) — valid\(tier.map { " (tier=\($0))" } ?? "")")
+                case .rateLimited:
+                    ok("lingmodel token: \(lmSource)\(lmActLabel) — valid (currently rate-limited)")
+                case .rejected:
+                    bad("lingmodel token: \(lmSource)\(lmActLabel) — present but REJECTED by the server (expired, revoked, or retired by the active-token cap): \(LingModelAuth.remintHint)")
+                case .unreachable:
+                    neutral("lingmodel token: \(lmSource)\(lmActLabel) — present, could not verify (server unreachable)")
+                }
+            }
+        } else if lmIsDefault {
+            // Only an error when it's the provider bare `lingcode` will actually use.
+            bad("lingmodel token: not configured\(lmActLabel) — and lingmodel is your DEFAULT provider, so every `lingcode` run will fail: \(LingModelAuth.remintHint)")
+        } else {
+            neutral("lingmodel token: not configured\(lmActLabel) — `lingcode auth login --provider lingmodel`")
         }
 
         // — Agent bridge
@@ -75,7 +121,14 @@ enum DoctorReport {
         let bundledRoot = bundleURL?.appendingPathComponent("agent-bridge").path
         if let bundledRoot,
            let loc = try? BridgeResourceLocator(extraSearchRoots: [bundledRoot]).locate() {
-            ok("agent bridge: \(loc.bridgeScriptPath)")
+            // The locator also searches an installed LingCode.app. Resolving there is
+            // fine on this machine and misleading everywhere else, so name which one
+            // answered rather than reporting a bare ✓.
+            if loc.bridgeScriptPath.hasPrefix(bundledRoot) {
+                ok("agent bridge: \(loc.bridgeScriptPath) (bundled)")
+            } else {
+                warn("agent bridge: \(loc.bridgeScriptPath) (LingCode.app — this install's own copy was not found)")
+            }
             if let v = sdkVersion(at: loc.bridgeScriptPath) {
                 info("  bundled sdk: \(v)")
             }
@@ -208,6 +261,10 @@ enum DoctorReport {
 
     private static func ok(_ s: String)      { Swift.print("  \(ANSI.styled("✓", ANSI.green,  fd: STDOUT_FILENO)) \(s)") }
     private static func bad(_ s: String)     { Swift.print("  \(ANSI.styled("✗", ANSI.red,    fd: STDOUT_FILENO)) \(s)") }
+    /// Works right now, but not the way the user probably assumes — a fallback that
+    /// will not hold on a different machine. Distinct from ✓ on purpose: reporting
+    /// these as healthy is how a broken install passes its own check.
+    private static func warn(_ s: String)    { Swift.print("  \(ANSI.styled("⚠", ANSI.yellow, fd: STDOUT_FILENO)) \(s)") }
     private static func neutral(_ s: String) { Swift.print("  \(ANSI.styled("•", ANSI.dim,    fd: STDOUT_FILENO)) \(s)") }
     private static func info(_ s: String)    { Swift.print("  \(ANSI.styled("·", ANSI.dim,    fd: STDOUT_FILENO)) \(s)") }
 
@@ -502,6 +559,7 @@ enum DoctorReport {
     enum NetworkProbeResult {
         case ok(latencyMs: Int), timeout, httpError(Int), skipped
     }
+
 
     /// HEAD request to api.anthropic.com with a short timeout. We don't actually
     /// hit a real endpoint that requires auth — just measure connectability.

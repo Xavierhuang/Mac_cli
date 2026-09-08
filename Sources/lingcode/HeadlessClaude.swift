@@ -59,6 +59,16 @@ func isTransientNetworkError(_ message: String) -> Bool {
         "enotfound", "enetdown", "ehostunreach", "network is unreachable",
         "operation timed out", "request timeout",
         "502", "503", "504", "gateway", "internal server error", "500",
+        // URLSession/NSError phrasings. The Node bridge passes the SDK's error
+        // description through verbatim, and CFNetwork words these differently
+        // from the POSIX/Node spellings above — "The network connection was
+        // lost." matched nothing here, so a dropped stream was reported as a
+        // hard failure and never retried. Seen against the LingModel proxy,
+        // which intermittently drops larger requests (2MB failed while 4MB
+        // succeeded on the same run, so it is flakiness, not a size limit).
+        "network connection was lost", "connection was lost",
+        "cannot connect to host", "network connection",
+        "-1005", "-1004", "-1001",
     ]
     return needles.contains(where: { lower.contains($0) })
 }
@@ -229,7 +239,16 @@ func runHeadlessClaude(
         }
         return ConfigStore.load().anthropicAPIKey
     }()
-    if anthropicKey == nil || anthropicKey?.isEmpty == true {
+    // A Pro/Max subscriber needs no API key: the bundled Agent SDK authenticates
+    // from the Claude Code session already on this machine. Only refuse when there
+    // is no credential of EITHER kind — refusing on a missing API key alone told
+    // subscribers to go buy credits they did not need.
+    //
+    // LingModel and DeepSeek-direct route elsewhere entirely, so this only applies
+    // to the Anthropic path.
+    let subscription = (useLingModel || useDeepSeekDirect) ? nil : ClaudeSubscriptionAuth.detect()
+
+    if (anthropicKey == nil || anthropicKey?.isEmpty == true) && subscription == nil {
         let msg: String
         if useLingModel {
             msg = """
@@ -255,11 +274,18 @@ func runHeadlessClaude(
                 """
         } else {
             msg = """
-                lingcode: ANTHROPIC_API_KEY is not set.
+                lingcode: no Anthropic credentials found.
 
-                Set it in your shell or via config:
+                If you have a Claude Pro or Max subscription, you do not need an API key —
+                sign in to Claude Code once and lingcode will use that session:
+                  claude /login
+                Or, for a headless machine:
+                  claude setup-token
+                  export CLAUDE_CODE_OAUTH_TOKEN=...
+
+                To use a metered API key instead:
+                  lingcode auth login --provider anthropic
                   export ANTHROPIC_API_KEY=sk-ant-...
-                  lingcode config set anthropic-api-key sk-ant-...
 
                 """
         }
@@ -300,7 +326,23 @@ func runHeadlessClaude(
     // already passes ANTHROPIC_API_KEY through extraEnvironment via the
     // `anthropicAPIKey` field; we just need to add the base URL.
     var extraEnv: [String: String] = [:]
-    if useLingModel { extraEnv["ANTHROPIC_BASE_URL"] = lingModelBaseURL }
+    if useLingModel {
+        extraEnv["ANTHROPIC_BASE_URL"] = lingModelBaseURL
+        // Keep the headless path on the same bridge contract as the REPL and the
+        // Mac app. Nothing here re-auths mid-run, but leaving these unset means
+        // `applyProviderEnv` takes a different branch than the other two surfaces
+        // — and that silent divergence is what made a live re-auth impossible.
+        extraEnv["LINGCODE_PROXY_BASE_URL"] = lingModelBaseURL
+        if let key = anthropicKey { extraEnv["LINGCODE_PROXY_AUTH_TOKEN"] = key }
+        // Required, not optional: bridge.mjs reads currentModel from this env var
+        // (or a later set_model) and ignores the per-query command's model, so
+        // without a `lingmodel*` tag here applyProviderEnv never installs the proxy
+        // bearer and every request 401s. Same trap the REPL had.
+        let lmTag = (resolvedModel?.hasPrefix("lingmodel") == true)
+            ? resolvedModel!
+            : LingModelAuth.defaultModelTag
+        extraEnv["LINGCODE_CLAUDE_MODEL"] = lmTag
+    }
     if useDeepSeekDirect, let key = anthropicKey {
         // Mirrors DeepSeek's official Claude Code integration guide. AUTH_TOKEN
         // is what their compat layer expects; the *_DEFAULT_*_MODEL vars catch
@@ -315,6 +357,31 @@ func runHeadlessClaude(
         extraEnv["CLAUDE_CODE_SUBAGENT_MODEL"] = "deepseek-v4-flash"
         extraEnv["CLAUDE_CODE_EFFORT_LEVEL"] = "max"
     }
+    // Same trap as the LingModel note above, and it bit the plain `claude` provider
+    // too: bridge.mjs derives `currentModel` from LINGCODE_CLAUDE_MODEL at startup
+    // (bridge.mjs:169) and `buildOptions` reads that global, while the `model` field
+    // on the query command is only ever consumed by the `set_model` handler
+    // (bridge.mjs:1964). So a model resolved here reaches the bridge ONLY through
+    // this env var.
+    //
+    // Without it `--claude-model` was silently inert on the claude provider: the flag
+    // parsed, threaded through Ask.swift -> resolvedModel -> AgentBridgeConfiguration
+    // .modelOverride -> command["model"], and was then dropped on the floor, so every
+    // headless run used the Claude Code CLI's own default. Verified: asking for
+    // claude-sonnet-4-6 and for claude-haiku-4-5 both ran claude-opus-4-7.
+    // Repl.swift:537 and ClaudeCodeAgentService.swift:2329 already set this, which is
+    // why model selection worked in the REPL and the Mac app but not in `ask`.
+    if extraEnv["LINGCODE_CLAUDE_MODEL"] == nil, let resolvedModel {
+        extraEnv["LINGCODE_CLAUDE_MODEL"] = resolvedModel
+    }
+    // Tell the bridge this is not the GUI, so it can drop the three prompt blocks
+    // that only make sense inside the Mac app: the product description, the
+    // Xcode-symptom-to-LingCode-MENU map (there are no menus here), and the
+    // narration directive — which also forbids chaining tool calls and so
+    // serializes work that could be batched. ~6.9 KB of system prompt per query
+    // plus a round trip per tool call, for nothing, on every headless run.
+    // The Mac app and the REPL leave this unset and are unaffected.
+    extraEnv["LINGCODE_SURFACE"] = "headless"
 
     let config = AgentBridgeConfiguration(
         nodePath: nodePath,
@@ -328,7 +395,16 @@ func runHeadlessClaude(
         extraEnvironment: extraEnv,
         mcpServers: mcpServers,
         systemPrompt: systemPromptOverride,
-        appendSystemPrompt: appendSystemPrompt,
+        // Device-deploy preflight, checked here and stated up front rather than
+        // discovered one failed build at a time. The Mac app has done this for a
+        // while via SigningPreflightService; the CLI did not, so `lingcode ask`
+        // and every CI job started blind. Appends to — never replaces — a
+        // caller-supplied --append-system-prompt.
+        appendSystemPrompt: [DevicePreflight.contextBlock(cwd: cwd), appendSystemPrompt]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+            .nilIfEmpty,
         additionalDirectories: additionalDirectories,
         thinking: thinking,
         bridgeSocketPath: bridgeSocketPath
@@ -368,6 +444,8 @@ func runHeadlessClaude(
     var totalInputTokens = 0
     var totalOutputTokens = 0
     var totalCacheTokens = 0
+    // Reported by the Agent SDK; surfaced so callers can see how many turns a run took.
+    var numTurns: Int? = nil
     var retryAttempt = 0
     let maxRetries = 5
 
@@ -495,7 +573,8 @@ func runHeadlessClaude(
                 continue
             case .permissionResolved:
                 continue
-            case .queryFinished(let sid, _):
+            case .queryFinished(let sid, _, let turns):
+                if let turns { numTurns = turns }
                 for cmd in hooks.commands(for: .stop) {
                     await runHook(cmd, prompt: prompt, cwd: cwd)
                 }
@@ -529,6 +608,7 @@ func runHeadlessClaude(
                         "session_id": lastSessionId ?? "",
                         "text": responseText,
                         "tool_call_count": toolCallCount,
+                        "num_turns": numTurns as Any,
                         "input_tokens": totalInputTokens,
                         "output_tokens": totalOutputTokens,
                         "cache_tokens": totalCacheTokens,
@@ -629,7 +709,8 @@ func runHeadlessClaude(
                 continue
 
             case .sdkMessage, .subagentStarted, .subagentFinished, .sessionRecovered,
-                 .memoryWriteRequest, .skillWriteRequest, .sessionSearchRequest, .terminalReadRequest:
+                 .memoryWriteRequest, .skillWriteRequest, .sessionSearchRequest, .terminalReadRequest,
+                 .awaitingFirstMessage:
                 continue
             }
         }

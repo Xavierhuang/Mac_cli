@@ -125,7 +125,7 @@ func runHeadlessOpenAICompat(
 
     // Azure's "model" in the request body is ignored — the deployment is in the URL — but OpenAI SDKs
     // still expect the field to be present, so pass a harmless placeholder if the user didn't specify.
-    let resolvedModel = model ?? (isAzure ? "deployment" : (preset?.defaultModel ?? "gpt-4o-mini"))
+    let resolvedModel = model ?? (isAzure ? "deployment" : (preset?.defaultModel ?? "gpt-5.6-sol"))
     let authStyle: OpenAICompatClient.AuthStyle = isAzure
         ? .azureKey(apiVersion: azureApiVersion)
         : .bearer

@@ -36,6 +36,16 @@ enum CostEstimator {
     /// vendor publishes a new model. Keep entries sorted from specific to broad.
     private static let table: [(provider: String, modelMatch: String, rate: Rate)] = [
         // — openai
+        // Verified 2026-09-07. GPT-5.6 rates are promotional through at
+        // least 2026-11-21 — re-check before then.
+        ("openai", "gpt-6-astra", .init(input: 10.00, output: 50.00)),
+        ("openai", "gpt-5.6-sol", .init(input: 4.00,  output: 20.00)),
+        ("openai", "gpt-5.6-terra", .init(input: 2.00, output: 12.00)),
+        ("openai", "gpt-5.6-luna", .init(input: 0.20, output: 1.20)),
+        // "gpt-5" is no longer a real model id; it survives as the catch-all for
+        // any gpt-5.x without its own row above (e.g. gpt-5.5, whose rate OpenAI
+        // has not published). Lookup is a first-match `contains` scan, so this
+        // MUST stay below the specific gpt-5.6-* rows or it would swallow them.
         ("openai", "gpt-5",       .init(input: 3.00,  output: 15.00)),
         ("openai", "o1",          .init(input: 15.00, output: 60.00)),
         ("openai", "gpt-4o-mini", .init(input: 0.15,  output: 0.60)),

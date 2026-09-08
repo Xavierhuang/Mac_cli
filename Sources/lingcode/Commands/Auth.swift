@@ -327,10 +327,70 @@ struct Auth: ParsableCommand {
         func run() throws {
             let base = try accountFor(provider)
             let kAccount = keychainAccount(base: base, account: account)
+            let label = (account?.isEmpty == false) ? " (\(account!))" : ""
+
+            // A key can live in three places and runtime reads all three. Clearing
+            // only the Keychain and then printing "removed" was a success message
+            // that wasn't true: `lingcode config set anthropic-api-key …` writes
+            // PLAINTEXT to ~/.lingcode/config.json, and that copy kept working.
+            var cleared: [String] = []
+
+            let hadKeychain = ((try? SecretStore.get(service: keychainService, account: kAccount)) ?? "").isEmpty == false
             try? SecretStore.delete(service: keychainService, account: kAccount)
             try? unregisterAccount(provider: provider, account: account)
-            let label = (account?.isEmpty == false) ? " (\(account!))" : ""
-            Swift.print("✓ \(provider)\(label) API key removed from keychain.")
+            if hadKeychain { cleared.append("keychain") }
+
+            // config.json has one slot per provider, with no account dimension —
+            // so only clear it when removing the default slot, or a named account
+            // would silently wipe the shared fallback.
+            if account?.isEmpty != false, let configKey = Self.configKey(forProvider: provider) {
+                if let existing = ConfigStore.get(key: configKey), !existing.isEmpty {
+                    try? ConfigStore.unset(key: configKey)
+                    cleared.append("config.json")
+                }
+            }
+
+            if cleared.isEmpty {
+                Swift.print("• \(provider)\(label): no stored key found (nothing to remove).")
+            } else {
+                Swift.print("✓ \(provider)\(label) API key removed from \(cleared.joined(separator: " + ")).")
+            }
+
+            // An env var outlives any of this and still wins at runtime. Saying
+            // "removed" while the key is still active would repeat the same lie in
+            // a different place.
+            if let envVar = Self.envVar(forProvider: provider),
+               let live = ProcessInfo.processInfo.environment[envVar],
+               !live.trimmingCharacters(in: .whitespaces).isEmpty {
+                Swift.print("""
+
+                    ⚠ \(envVar) is still set in this shell and takes precedence at runtime.
+                      The key is not gone until you `unset \(envVar)` (and remove it from
+                      your shell profile if it is set there).
+                    """)
+            }
+
+            // Deleting a local copy does not un-leak a key. Anything that reached a
+            // prompt, a transcript, or a provider's logs has to be revoked upstream.
+            Swift.print("""
+
+                If this key was pasted somewhere it shouldn't be — a prompt, a commit, a
+                screen share — rotate it at the provider instead. Deleting the local copy
+                does not invalidate it.
+                """)
+        }
+
+        /// The `config.json` slot for a provider, when it has one.
+        static func configKey(forProvider provider: String) -> String? {
+            switch provider {
+            case "anthropic": return "anthropic-api-key"
+            case "deepseek":  return "deepseek-api-key"
+            default:          return nil
+            }
+        }
+
+        static func envVar(forProvider provider: String) -> String? {
+            knownProviders.first { $0.name == provider }?.envVar
         }
     }
 

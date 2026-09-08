@@ -114,7 +114,7 @@ struct OpenAICompatREPL {
                 "lingcode: http idle timeout = \(Int(timeoutSeconds))s\n".utf8
             ))
         }
-        var currentModel = modelOverride ?? preset?.defaultModel ?? "gpt-4o-mini"
+        var currentModel = modelOverride ?? preset?.defaultModel ?? "gpt-5.6-sol"
         // Cached result of the most recent `/model` (no arg) listing, so a
         // follow-up `/model 3` resolves to the third entry without re-fetching.
         var modelChoices: [String] = []
@@ -241,6 +241,10 @@ struct OpenAICompatREPL {
         // Images staged via /image and flushed into the next user turn.
         var pendingImages: [String] = []
 
+        // Deadline for the "press Ctrl-C again to exit" window. Declared outside the
+        // turn loop so it survives the prompt being redrawn between presses.
+        var ctrlCArmedUntil: TimeInterval?
+
         while true {
             // Multi-line dashboard above the prompt. TTY-gated inside.
             let dashboard = await renderDashboard(
@@ -269,8 +273,21 @@ struct OpenAICompatREPL {
                     switch editor.readLine(prompt: prompt) {
                     case .line(let s):      chunk = s
                     case .eof:              chunk = nil
-                    case .interrupted:
+                    case .interrupted(let hadInput):
+                        // Same trap as the Claude REPL: raw mode means Ctrl-C never
+                        // raises SIGINT here, so without this the key could only
+                        // ever clear the line and never exit.
                         assembled = ""
+                        if hadInput {
+                            ctrlCArmedUntil = nil
+                            continue readOneInput
+                        }
+                        let now = Date().timeIntervalSinceReferenceDate
+                        if let armed = ctrlCArmedUntil, now <= armed { return }
+                        ctrlCArmedUntil = now + 5  // see Repl.swift: 2s expired mid-keypress
+                        FileHandle.standardError.write(Data(
+                            "Press Ctrl-C again to exit (or /quit)\n".utf8
+                        ))
                         continue readOneInput
                     }
                 } else if let tty = tty {
@@ -324,7 +341,7 @@ struct OpenAICompatREPL {
                 case "help", "?":
                     Swift.print("""
 
-                      /model <name>     Switch model (e.g. gpt-4o, llama-3.1-70b-versatile)
+                      /model <name>     Switch model (e.g. gpt-5.6-sol, gpt-6-astra, llama-3.3-70b-versatile)
                       /reset            Clear conversation history
                       /system <text>    Replace the system prompt (applies from next turn)
                       /cost             Show token usage totals

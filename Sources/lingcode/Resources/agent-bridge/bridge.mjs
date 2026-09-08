@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { dirname as nodeDirname } from 'node:path'
 import { spawn, execSync } from 'node:child_process'
 import { rtkRewriteCommand } from './rtk.mjs'
+import { verifyOutcome } from './lib/outcome-verify.mjs'
 import { productionBackendApplyMetadata } from './lib/backend-deploy-permission.mjs'
 import { claudeEffortOption } from './lib/claude-effort.mjs'
 
@@ -81,7 +82,7 @@ const LINGCODE_ABOUT_DIRECTIVE = [
   '',
   'LingCode is an all-in-one native macOS AI coding IDE that also ships a `lingcode` CLI, iPad and Android apps, and a managed Cloud backend.',
   '',
-  '**LingCode Cloud** is a managed backend-as-a-service (its own product, not a third party): a managed **Postgres** database with built-in **auth** (email/password, magic-link, OTP, Google/GitHub/Apple OAuth), **file storage**, **realtime** row subscriptions (RLS-filtered), **vector search** (pgvector), server-side **serverless functions** (sandboxed Deno + built-ins like email/Stripe/http-fetch) and an encrypted secrets vault, plus full-stack **app hosting** (static frontends at lingcode.dev/apps/, and SSR apps — Next.js/SvelteKit/Nuxt/Astro/Remix/TanStack — on Cloudflare Workers at *.run.lingcode.dev). The data API (via the `lingcode-cloud` MCP tools and the injected `window.lingcode` SDK) supports single-table CRUD with filters, **batch insert**, **upsert** (`ON CONFLICT`), and **`rpc`** for complex reads (JOINs/CTEs/aggregates/full-text ranking) defined as SQL functions in a migration. So secrets, Stripe, email, and most server logic run ON LingCode Cloud — don\'t tell users to stand up an external server or use localStorage for shared/persisted data.',
+  '**LingCode Cloud** is a managed backend-as-a-service (its own product, not a third party): a managed **Postgres** database with built-in **auth** (email/password, magic-link, OTP, Google/GitHub/Apple OAuth), **file storage**, **realtime** row subscriptions (RLS-filtered), **vector search** (pgvector), server-side **serverless functions** (sandboxed Deno + built-ins like email/Stripe/http-fetch) and an encrypted secrets vault, plus full-stack **app hosting** (static frontends at lingcode.dev/apps/, and SSR apps — Next.js/SvelteKit/Nuxt/Astro/Remix/TanStack — on Cloudflare Workers at *.lingcode.app). To publish a static frontend, build it and call the `deploy_app` tool with the build OUTPUT directory; never upload files to storage to serve a web page. The data API (via the `lingcode-cloud` MCP tools and the injected `window.lingcode` SDK) supports single-table CRUD with filters, **batch insert**, **upsert** (`ON CONFLICT`), and **`rpc`** for complex reads (JOINs/CTEs/aggregates/full-text ranking) defined as SQL functions in a migration. So secrets, Stripe, email, and most server logic run ON LingCode Cloud — don\'t tell users to stand up an external server or use localStorage for shared/persisted data.',
   '',
   'BUT it is an EDGE/SERVERLESS platform, NOT a general-purpose server host — do NOT claim it "hosts everything." Its hosting runtime is a Cloudflare V8 isolate, NOT Node.js, so it does NOT run: long-running Node processes, persistent WebSocket servers, background queues/workers, a single request over ~30s, or non-JS backends (Python/Django, Rails, Go). A plain Express/`next start` server must be ported to a Worker-targeting framework (Hono, TanStack Start, OpenNext adapter). Work that doesn\'t fit (scrapers, long ingest pipelines, minutes-long jobs) runs on a server the USER operates and writes into the managed backend over the gateway.',
   '',
@@ -169,12 +170,97 @@ let activeAbortController = null
 let currentModel = normalizeString(process.env.LINGCODE_CLAUDE_MODEL) ?? null
 const pendingPermissionRequests = new Map()
 
+// Which surface is driving this bridge. The Mac app leaves it unset, so its
+// behaviour is unchanged; `lingcode ask --headless` (and `lingcode build`, which
+// goes through the same runHeadlessClaude path) sets it to 'headless'.
+//
+// Three of the appended prompt blocks exist for the GUI and cost real money
+// everywhere else — about 6.9 KB of system prompt per query:
+//
+//   LINGCODE_ABOUT_DIRECTIVE        3.7 KB  a product description, for when a
+//                                           user asks the agent what LingCode is
+//   LINGCODE_IDE_SURFACES_DIRECTIVE 2.5 KB  maps Xcode symptoms onto LingCode
+//                                           MENUS — there are no menus headless,
+//                                           so it is not merely wasted, it points
+//                                           the agent at UI that isn't there
+//   NARRATION_DIRECTIVE             0.7 KB  forces prose before and after every
+//                                           tool call so the app's transcript
+//                                           reads well
+//
+// Only the first two are dropped headlessly. Both are safe to drop on correctness
+// grounds alone, independent of any speed argument: neither describes anything the
+// agent can act on outside the GUI, and the menu map actively points it at UI that
+// does not exist. Measured saving: 6,596 tokens per query (18,867 -> 12,271 on a
+// minimal prompt) — worth about 5% of context on a real task, not 35%.
+//
+// NARRATION is deliberately NOT dropped by default. The theory was that its "never
+// chain multiple tool calls with no text between them" clause serialized work and
+// explained the ~38% gap against plain Claude Code on Lane 3. That theory was
+// tested and is not supported: with all three blocks removed the headless arm got
+// no faster, and on one task it was markedly slower. n=1 could not separate that
+// from run-to-run drift (every arm slowed that day), so the honest state is
+// "unknown", and unknown is not a reason to remove something that may well be
+// helping the model plan. Set LINGCODE_NARRATION=off to measure it properly with
+// repeated trials; flip the default only if the data says so.
+const IS_HEADLESS = normalizeString(process.env.LINGCODE_SURFACE) === 'headless'
+// Narration is GUI chrome: it exists so the Mac app's transcript reads as prose.
+// Headless it is not merely unread, it is EXPENSIVE — the directive says "never
+// chain multiple tool calls with no text between them", which bills a round trip
+// per tool call.
+//
+// Measured (benchmarks/xcode, n=5 per arm, same model):
+//   2-tool-call task   narration off: -2.7%  (within noise)
+//   11-turn task       narration off: -27.7% -> and -16.8% against plain Claude
+//                                              Code, i.e. behind becomes ahead.
+// Correctness was unchanged in every trial. The cost scales with tool calls,
+// which is why a device deploy should benefit most of all.
+//
+// So: off by default headless, on by default in the app. LINGCODE_NARRATION
+// overrides either way ('on' | 'off').
+const NARRATION_ENV = normalizeString(process.env.LINGCODE_NARRATION)
+const NARRATION_OFF = NARRATION_ENV === 'off' || (IS_HEADLESS && NARRATION_ENV !== 'on')
+
 // Defense-in-depth: if the SDK stream goes silent mid-query (a stalled upstream
 // API that emits nothing further), abort it after this much inactivity and emit a
 // real `query_failed` event instead of hanging forever. Kept BELOW the Swift
-// `stallThreshold` (~120s) so Node aborts first and the app renders a clean
+// `stallThreshold` (~300s) so Node aborts first and the app renders a clean
 // failure rather than relying on its own heartbeat backstop.
-const PER_QUERY_INACTIVITY_MS = 90_000
+// Do not kill a live stream for being slow.
+//
+// This was 90s, on the premise that "every SDK message resets this, so
+// mid-stream silence is real". That premise is false: a high-effort reasoning
+// model was observed going quiet well past 90s without emitting thinking deltas
+// at all, producing "Claude stopped responding … mid-response" on a perfectly
+// healthy turn. Two narrower fixes were tried first — exempting thinking blocks,
+// then exempting any open assistant message — and both were wrong. The thinking
+// exemption did nothing because this provider never emits thinking blocks, and
+// the message-open exemption could never lift if message_stop went missing,
+// which is precisely the unbounded-exemption trap ClaudeCodeAgentService warns
+// about ("it must not be able to suppress itself indefinitely").
+//
+// So: one flat, generous ceiling that only fires on a stream that is genuinely
+// dead for ten minutes, and no state-dependent exemptions to get wrong.
+//
+// This is not the primary defence for the Mac app — ClaudeCodeAgentService has
+// its own 300s watchdog that respawns the bridge, and it fires first. It IS the
+// only defence for `lingcode` in a terminal, which has no Swift layer, so it
+// must not be removed outright.
+const PER_QUERY_INACTIVITY_MS = 600_000
+
+// Time-to-first-token window. When a model-switch drops the session and re-
+// injects the whole prior conversation as a preamble, or when a long system
+// prompt / attachment set has to be tokenized before the API can start
+// streaming, TTFT legitimately runs past 90s. This is only the pre-first-
+// message ceiling; once ANY SDK event arrives (session_id, partial content,
+// anything), the loop drops back to the tight PER_QUERY_INACTIVITY_MS so a
+// mid-stream stall still gets caught fast.
+const FIRST_MESSAGE_INACTIVITY_MS = 240_000
+
+// Cadence of the "still waiting" heartbeat emitted BEFORE the first SDK
+// message arrives. Purpose: keep the Swift-side `stallThreshold` (~300s)
+// happy while Node uses its longer FIRST_MESSAGE_INACTIVITY_MS. Any value
+// well below the Swift threshold works; 30s is generous.
+const FIRST_MESSAGE_HEARTBEAT_MS = 30_000
 
 // While the model is generating a tool's input (e.g. a large Write whose content
 // is the whole file), the SDK surfaces NO intermediate messages for the entire
@@ -1055,6 +1141,47 @@ function buildSubagentLifecycleHooks(queryId) {
     hooks.PreToolUse = [{ matcher: 'Bash', hooks: [onPreBash] }]
   }
 
+  // Outcome verification: catch a command that exited green while verifying
+  // nothing, and tell the model what its own output actually says.
+  //
+  // PRODUCT.md claims the product "refuses to report success on a step that only
+  // looked green". benchmarks/xcode/lanes/falsesuccess.sh measured that claim and
+  // found it false: given "** TEST SUCCEEDED **" alongside "Executed 0 tests",
+  // the agent reported the tests pass — the same answer plain Claude Code gave.
+  //
+  // This is not a prompt asking the model to be careful; two prompt-level
+  // attempts in this codebase's history failed that way. It appends a fact that
+  // is already in the output and easy to skim past, which is the same mechanism
+  // as injecting compiler errors — measured in the ablation lane as worth about
+  // a turn.
+  //
+  // additionalContext, not updatedToolOutput: the real output is evidence and
+  // must reach the model intact. This adds to it and never edits it.
+  if (process.env.LINGCODE_OUTCOME_VERIFY !== '0') {
+    const onPostBash = async (input) => {
+      try {
+        const out = input?.tool_response
+        const text = typeof out === 'string'
+          ? out
+          : (typeof out?.stdout === 'string' ? out.stdout : '') +
+            (typeof out?.stderr === 'string' ? out.stderr : '')
+        const finding = verifyOutcome(input?.tool_input?.command, text)
+        if (!finding) return { continue: true }
+        return {
+          continue: true,
+          hookSpecificOutput: {
+            hookEventName: 'PostToolUse',
+            additionalContext: finding.note,
+          },
+        }
+      } catch {
+        // A verifier fault must never break the tool call it is inspecting.
+        return { continue: true }
+      }
+    }
+    hooks.PostToolUse = [{ matcher: 'Bash', hooks: [onPostBash] }]
+  }
+
   return hooks
 }
 
@@ -1484,6 +1611,24 @@ async function runPrompt(command) {
 
   // Build options once; `resume` and `abortController` are the only fields that
   // differ between the initial attempt and a resume-recovery retry.
+  // Everything we bolt on top of Claude Code's own prompt. Built once so the
+  // preset path and the custom-system-prompt path cannot drift apart.
+  //
+  // NARRATION is on unless LINGCODE_NARRATION=off; measured at -2.7% on task 001
+  // with overlapping ranges, i.e. no evidence either way, so it stays.
+  // The ABOUT and IDE-SURFACES blocks are dropped headlessly: neither describes
+  // anything actionable outside the GUI, and together they cost 6,596 tokens per
+  // query (18,867 -> 12,271 on a minimal prompt).
+  const APPENDED_DIRECTIVES = [
+    isLingModelTag(currentModel) ? LINGMODEL_IDENTITY_DIRECTIVE : null,
+    NARRATION_OFF ? null : NARRATION_DIRECTIVE,
+    ...(IS_HEADLESS ? [] : [
+      LINGCODE_ABOUT_DIRECTIVE,
+      LINGCODE_IDE_SURFACES_DIRECTIVE,
+    ]),
+    customAppendSystemPrompt || null,
+  ].filter(Boolean).join('\n\n')
+
   const buildOptions = (resumeId, abortController) => ({
     cwd,
     maxTurns,
@@ -1503,18 +1648,37 @@ async function runPrompt(command) {
     ...(allowedTools ? { allowedTools } : {}),
     ...(disallowedTools ? { disallowedTools } : {}),
     ...(mcpServers ? { mcpServers } : {}),
-    ...(customSystemPrompt ? { systemPrompt: customSystemPrompt } : {}),
+    // Opt into Claude Code's real system prompt.
+    //
+    // THIS IS LOAD-BEARING. In the Agent SDK, omitting `systemPrompt` does not mean
+    // "use the Claude Code default" — it means EMPTY. From sdk-bundle.mjs:
+    //
+    //     if (J === void 0) H = "";
+    //     else if (J.type === "preset") K = J.append, N = J.excludeDynamicSections;
+    //
+    // So every bridge session used to run with no Claude Code system prompt at all:
+    // no tool guidance, and critically no dynamic environment section — which is
+    // where the working directory is stated. Our appended directives were, in
+    // effect, the entire system prompt.
+    //
+    // The cost was measured (benchmarks/xcode task 001, n=5 per arm, same model):
+    // the bridge opened every single run by reading an invented absolute path
+    // (/root/..., /Users/user/..., /HelloSwiftUI/...), 0/5 correct, then ran `find`
+    // and re-read — 5.0 tool calls per run against plain Claude Code's 2.0, and 66%
+    // slower with non-overlapping ranges. Appending the path as prose did NOT fix
+    // it (tried twice, still 0/5): the model needs the preset's structured
+    // environment section, not a sentence.
+    //
+    // `append` carries our directives so they survive; a caller-supplied
+    // --system-prompt still replaces everything, as before.
+    ...(customSystemPrompt
+      ? { systemPrompt: customSystemPrompt }
+      : { systemPrompt: { type: 'preset', append: APPENDED_DIRECTIVES } }),
     ...(additionalDirectories ? { additionalDirectories } : {}),
     ...claudeEffortOption(command.effort),
     ...(thinkingEnabled ? { thinking: { type: 'enabled', budget_tokens: command.thinkingBudgetTokens ?? 8000 } } : {}),
     ...(customAgents && Object.keys(customAgents).length > 0 ? { agents: customAgents } : {}),
-    appendSystemPrompt: [
-      isLingModelTag(currentModel) ? LINGMODEL_IDENTITY_DIRECTIVE : null,
-      NARRATION_DIRECTIVE,
-      LINGCODE_ABOUT_DIRECTIVE,
-      LINGCODE_IDE_SURFACES_DIRECTIVE,
-      customAppendSystemPrompt || null,
-    ].filter(Boolean).join('\n\n'),
+    ...(customSystemPrompt ? { appendSystemPrompt: APPENDED_DIRECTIVES } : {}),
     canUseTool: createPermissionHandler(queryId, permissionMode),
     hooks: buildSubagentLifecycleHooks(queryId),
     // Live ~30s AI-generated progress summaries from running subagents.
@@ -1550,8 +1714,34 @@ async function runPrompt(command) {
   // Inactivity watchdog (see PER_QUERY_INACTIVITY_MS). Re-armed on every SDK
   // message; if it fires the query is aborted and reported as `query_failed`,
   // distinguished from a user cancel via `inactivityAborted`.
+  //
+  // Before the first SDK message arrives we use the longer
+  // FIRST_MESSAGE_INACTIVITY_MS window because a model-switch mid-conversation
+  // (which re-injects the whole prior transcript as a preamble) or a big
+  // multi-attachment prompt can push TTFT above 90s. Once ANY message flows
+  // we drop back to the tight PER_QUERY_INACTIVITY_MS window so a mid-stream
+  // stall still gets caught fast.
   let inactivityTimer = null
   let inactivityAborted = false
+  let hasReceivedFirstMessage = false
+  // Emits a "still waiting" heartbeat every FIRST_MESSAGE_HEARTBEAT_MS while
+  // we're in the pre-first-message window, so the Swift-side stall watchdog
+  // (~300s) doesn't fire even though we're deliberately silent from the SDK.
+  // Cleared as soon as the first SDK message arrives.
+  let firstMessageHeartbeat = null
+  const startFirstMessageHeartbeat = () => {
+    if (firstMessageHeartbeat) clearInterval(firstMessageHeartbeat)
+    firstMessageHeartbeat = setInterval(() => {
+      emit({
+        type: 'query_awaiting_first_message',
+        queryId,
+        sessionId: currentSessionId,
+      })
+    }, FIRST_MESSAGE_HEARTBEAT_MS)
+  }
+  const clearFirstMessageHeartbeat = () => {
+    if (firstMessageHeartbeat) { clearInterval(firstMessageHeartbeat); firstMessageHeartbeat = null }
+  }
   // Indices of tool_use content blocks currently being generated. While any is
   // open the model is provably mid-generation (a big Write etc.), so the timer
   // uses the generous TOOL_GEN_INACTIVITY_MS instead of the normal ceiling.
@@ -1571,8 +1761,9 @@ async function runPrompt(command) {
     if (ev.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
       if (typeof ev.index === 'number') openToolBlocks.add(ev.index)
     } else if (ev.type === 'content_block_stop') {
-      // Only tool_use indices sit in openToolBlocks — text/thinking blocks
-      // aren't tracked. Closing one hands control to the tool executor.
+      // A closing tool_use block hands control to the tool executor, so it
+      // converts into a pending result. A closing thinking block just ends the
+      // silent stretch — nothing is owed back, so it only clears.
       if (typeof ev.index === 'number' && openToolBlocks.has(ev.index)) {
         openToolBlocks.delete(ev.index)
         pendingToolResults += 1
@@ -1581,10 +1772,28 @@ async function runPrompt(command) {
       openToolBlocks.clear()
     }
   }
+  // Timer window resolution:
+  //   provably generating  → TOOL_GEN_INACTIVITY_MS (10min — the model is
+  //                          mid tool-input or mid extended-thinking, both of
+  //                          which the SDK streams silently for minutes)
+  //   pre-first-message    → FIRST_MESSAGE_INACTIVITY_MS (4min — TTFT can
+  //                          run long on a large context / preamble)
+  //   normal per-turn      → PER_QUERY_INACTIVITY_MS (10min — nothing is known
+  //                          to be in flight, but a reasoning model can still
+  //                          go quiet for minutes between deltas; see the
+  //                          constant's own comment for why 90s was wrong)
+  let lastArmedMs = 0
   const armInactivityTimer = () => {
     if (inactivityTimer) clearTimeout(inactivityTimer)
+    // Thinking counts the same as tool generation: in both the model is
+    // provably working. Only thinking was previously unprotected, which is what
+    // aborted high-effort reasoning turns at 90s.
     const midToolWork = openToolBlocks.size > 0 || pendingToolResults > 0
-    const ms = midToolWork ? TOOL_GEN_INACTIVITY_MS : PER_QUERY_INACTIVITY_MS
+    let ms
+    if (midToolWork) ms = TOOL_GEN_INACTIVITY_MS
+    else if (!hasReceivedFirstMessage) ms = FIRST_MESSAGE_INACTIVITY_MS
+    else ms = PER_QUERY_INACTIVITY_MS
+    lastArmedMs = ms
     inactivityTimer = setTimeout(() => {
       inactivityAborted = true
       activeAbortController?.abort(new Error('inactivity-timeout'))
@@ -1598,11 +1807,20 @@ async function runPrompt(command) {
     let retry = true
     while (retry) {
       retry = false
+      // A resume-recovery retry ALSO starts in the pre-first-message window
+      // (the fresh session has to re-tokenize the reinjected context), so
+      // reset the flag AND restart the heartbeat before startStream fires.
+      hasReceivedFirstMessage = false
+      startFirstMessageHeartbeat()
       const stream = startStream(effectiveResumeId, promptInput)
       armInactivityTimer()
       try {
         for await (const message of stream) {
           if (message && typeof message === 'object') {
+            if (!hasReceivedFirstMessage) {
+              hasReceivedFirstMessage = true
+              clearFirstMessageHeartbeat()
+            }
             if (typeof message.session_id === 'string' && message.session_id) {
               currentSessionId = message.session_id
             }
@@ -1646,6 +1864,7 @@ async function runPrompt(command) {
         }
 
         clearInactivityTimer()
+        clearFirstMessageHeartbeat()
         // A non-recoverable `is_error` result (model-not-found, upstream 4xx, quota)
         // arrives here as a normal stream end, not a thrown error — the recoverable
         // shapes were already re-raised + retried above. Surface it as `query_failed`
@@ -1671,15 +1890,24 @@ async function runPrompt(command) {
         }
       } catch (error) {
         clearInactivityTimer()
+        clearFirstMessageHeartbeat()
         // Inactivity abort: the stream went silent and our watchdog killed it.
         // Surface a real failure (so the app stops the spinner and offers resume)
-        // rather than a user-cancel.
+        // rather than a user-cancel. Report the specific window that fired
+        // (pre-first-message vs mid-stream vs mid-tool) so a user hitting the
+        // longer TTFT ceiling on a big context switch sees a useful number.
         if (inactivityAborted) {
+          const seconds = Math.round(lastArmedMs / 1000)
+          const phase = !hasReceivedFirstMessage
+            ? 'while waiting for the first token'
+            : (openToolBlocks.size > 0 || pendingToolResults > 0)
+              ? 'during tool execution'
+              : 'mid-response'
           emit({
             type: 'query_failed',
             queryId,
             sessionId: currentSessionId,
-            message: `Claude stopped responding (no activity for ${Math.round(PER_QUERY_INACTIVITY_MS / 1000)}s).`,
+            message: `Claude stopped responding (no activity for ${seconds}s ${phase}).`,
             rss: process.memoryUsage().rss,
           })
           return
@@ -1746,6 +1974,7 @@ async function runPrompt(command) {
     }
   } finally {
     clearInactivityTimer()
+    clearFirstMessageHeartbeat()
     activeQuery = null
     activeQueryId = null
     activeAbortController = null

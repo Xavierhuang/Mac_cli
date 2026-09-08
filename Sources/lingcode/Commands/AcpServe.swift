@@ -173,7 +173,7 @@ struct AcpServe: AsyncParsableCommand {
             stderr("lingcode acp-serve: \(envVar) is not set.")
             throw ExitCode(1)
         }
-        let model = preset?.defaultModel ?? "gpt-4o"
+        let model = preset?.defaultModel ?? "gpt-5.6-sol"
         let client = OpenAICompatClient(apiKey: apiKey, baseURL: baseURL)
         return OpenAICompatAgentServer(
             agentID: ACPAgentID("openai-compat:\(providerName)"),

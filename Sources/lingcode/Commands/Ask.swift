@@ -61,10 +61,15 @@ struct Ask: AsyncParsableCommand {
     @Flag(name: .long, help: "Force headless mode even if LingCode.app is running.")
     var headless: Bool = false
 
-    @Option(name: .long, help: "Provider: claude | deepseek | deepseek-claude | openai | gemini | kimi | qwen | groq | together | openrouter | mistral | xai | fireworks | ollama | deepseek-compat. (deepseek-claude routes the user's DeepSeek key through the Claude Code agent loop via DeepSeek's /anthropic endpoint.) (default: from config, else claude)")
+    @Option(name: .long, help: "Provider: lingmodel (hosted — sign in, no key) | claude | deepseek | deepseek-claude | openai | gemini | kimi | qwen | groq | together | openrouter | mistral | xai | fireworks | ollama | deepseek-compat. (deepseek-claude routes the user's DeepSeek key through the Claude Code agent loop via DeepSeek's /anthropic endpoint.) (default: from config, else claude)")
     var provider: String?
 
-    @Option(name: .long, help: "DeepSeek model: deepseek-v4-pro, deepseek-v4-flash (default), or legacy deepseek-chat / deepseek-reasoner (retiring 2026-07-24). (deepseek provider only)")
+    // Applies to EVERY OpenAI-compat provider, not just deepseek — the value is
+    // forwarded verbatim to runHeadlessOpenAICompat below, so it is also the
+    // only way to reach a model newer than the app's hand-maintained pickers
+    // (e.g. --provider openai --model gpt-6-astra). The help text used to say
+    // "deepseek provider only", which hid that.
+    @Option(name: .long, help: "Model id, passed through verbatim to the provider. Applies to openai, gemini, kimi, qwen, groq, together, openrouter, mistral, xai, fireworks, ollama, azure and deepseek. Use it to reach any model the provider accepts, including ones newer than this build (e.g. --provider openai --model gpt-6-astra). Default deepseek-v4-flash is DeepSeek's; for every other provider, omitting this uses that provider's own default. (For Claude use --claude-model.)")
     var model: String = "deepseek-v4-flash"
 
     @Option(name: .long, help: "Override Claude model (e.g. claude-sonnet-4-6). (claude provider only)")
@@ -496,6 +501,25 @@ struct Ask: AsyncParsableCommand {
 
     // MARK: - Prompt assembly
 
+    /// Is stdin readable — has data, or has hit EOF — within `timeoutMs`?
+    ///
+    /// `isatty() == 0` is true for three different things: a pipe with data, a
+    /// closed/redirected file, and a pipe someone is holding open and never
+    /// writing to. Only the third is a trap, and `readToEnd()` cannot tell it
+    /// apart — it simply blocks forever. That is not hypothetical: every agent
+    /// harness and CI runner that spawns `lingcode ask "…"` with an inherited
+    /// stdin pipe hung indefinitely at 0% CPU with no output.
+    ///
+    /// EOF counts as readable, so a genuine `cat file | lingcode ask` and a
+    /// `< /dev/null` both return immediately. The cost is a producer slower
+    /// than the timeout losing its piped context — a bounded, visible loss,
+    /// against an unbounded hang.
+    private static func stdinHasInput(timeoutMs: Int32) -> Bool {
+        var fds = pollfd(fd: 0, events: Int16(POLLIN), revents: 0)
+        let ready = withUnsafeMutablePointer(to: &fds) { poll($0, 1, timeoutMs) }
+        return ready > 0
+    }
+
     private func buildPrompt() throws -> String {
         let stdinPiped = isatty(fileno(stdin)) == 0
         let arg = prompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -517,7 +541,8 @@ struct Ask: AsyncParsableCommand {
 
         // Case 2: no prompt argument and stdin is piped → use stdin entirely.
         if arg.isEmpty {
-            if stdinPiped, let data = try? FileHandle.standardInput.readToEnd() {
+            if stdinPiped, Self.stdinHasInput(timeoutMs: 2_000),
+               let data = try? FileHandle.standardInput.readToEnd() {
                 let text = (String(data: data, encoding: .utf8) ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !text.isEmpty { return text }
@@ -527,7 +552,8 @@ struct Ask: AsyncParsableCommand {
         }
 
         // Case 3: prompt argument + piped stdin → append stdin as context.
-        if stdinPiped, let data = try? FileHandle.standardInput.readToEnd() {
+        if stdinPiped, Self.stdinHasInput(timeoutMs: 500),
+           let data = try? FileHandle.standardInput.readToEnd() {
             let extra = (String(data: data, encoding: .utf8) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if !extra.isEmpty {
